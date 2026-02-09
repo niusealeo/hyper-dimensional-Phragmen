@@ -992,8 +992,8 @@ def run_full_chamber_completion(
             break
 
     if R2 is None:
-        # If never reaches >2/3, fall back to at least seats (or whatever ran)
-        R2 = max(seats, len(winners))
+        # If can't reach seats (or projection target >2/3), fall back to at least projection target >2/3 or cap at what we actually elected.
+        R2 = len(winners)
 
     return {
         "label": label,
@@ -1001,6 +1001,7 @@ def run_full_chamber_completion(
         "full_chamber_rounds": R2,
         "full_chamber_winners": winners[:R2],
         "full_chamber_projection": intervals[R2-1][1] if R2-1 < len(intervals) else _res["final_projection"],
+        "infeasible_full_chamber": (len(winners) < seats),
         "rounds_csv": rounds_csv,
         "quota_csv": quota_csv,
         "projection_csv": proj_csv,
