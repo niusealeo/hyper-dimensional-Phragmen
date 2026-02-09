@@ -322,3 +322,17 @@ This code version is:
 - Not certified for statutory elections
 
 ---
+
+## Proposed repo layout
+
+```graphql
+phragmen/
+  __init__.py
+  engine.py          # the calculation engine (pure mechanics)
+  io.py              # JSON parsing, canonicalization helpers
+  profiles.py        # profile registry + selection + (later) scaling logic
+  types.py           # dataclasses (Group, Profile, results)
+  cli.py             # argparse, prompting, wiring
+phragmen_seq.py      # small entrypoint that calls phragmen.cli:main()
+README.md
+```
