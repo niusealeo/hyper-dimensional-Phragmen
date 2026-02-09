@@ -333,6 +333,6 @@ phragmen/
   profiles.py        # profile registry + selection + (later) scaling logic
   types.py           # dataclasses (Group, Profile, results)
   cli.py             # argparse, prompting, wiring
-phragmen_seq.py      # small entrypoint that calls phragmen.cli:main()
+iterative_phragmen_seq.py      # small entrypoint that calls phragmen.cli:main()
 README.md
 ```
