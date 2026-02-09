@@ -111,7 +111,7 @@ This decouples:
 
 ## 4. Iterative convergence process
 
-The engine supports **controlled iterative reselection**.
+The engine supports **controlled iterative reselection** using repeated Sequential Phragmén passes (A/B).
 
 ### Pass 1
 - Normal sequential run
@@ -129,9 +129,61 @@ Each iteration has two phases:
 - Allow-only pool = entire Part-A winner list
 - Run until projection **strictly exceeds 5/9**
 
-#### Convergence test
-- Compare Part-B prefix (up to projection > 5/9)
-- If identical to previous iteration → **converged**
+Instead of checking only “did this iteration match the immediately previous one?”, the code uses a **signature map** so that **any repeat** is detected immediately — including longer cycles.
+
+### 4.1 What is a “signature” (twinning key)?
+
+For each **Part B** run we compute the **prefix winner list** up to the first seat that makes projection strictly exceed **5/9**:
+
+- Projection target: `p_total > 5/9` (**strictly greater**)
+- Signature: `sig = tuple(prefix_winners_until(p_total > 5/9))`
+
+This signature represents the *twinning arrangement* for the projection-defined prefix.
+
+### 4.2 How repeats imply convergence or cycles
+
+We maintain a map:
+
+- `seen[sig] = first_iteration_index_where_sig_appeared`
+
+At each new iteration `it`:
+
+- If `sig` has **never appeared** before, store it and continue.
+- If `sig` **has appeared** before at iteration `j = seen[sig]`, then a **repeat signature** has occurred and we stop.
+
+This single rule covers both:
+
+- **Immediate convergence** (fixed point): cycle length `it - j = 1`
+- **Cyclic twins / longer cycles**: cycle length `it - j > 1`
+
+The cycle length is reported as:
+`cycle_length = it - j`
+
+
+The “selected” twin is always the **earliest occurrence** `j` (the first time that signature ever appeared), because the map stores only the first index.
+
+### 4.3 What happens after a repeat is found
+
+Once a repeat signature is detected, the election is treated as **solved enough** to proceed to final completion:
+
+- A fresh run is performed to build the **full chamber**.
+- The full chamber size is the larger of:
+  - the input seat count, or
+  - the first round where projection strictly exceeds **2/3**.
+
+`full_chamber_rounds = min R` such that:
+`R >= seats AND p_total > 2/3`
+
+### 4.4 Why use signature mapping?
+
+Using a signature map means:
+
+- You do **not** need a special-case “compare against immediately previous iteration”.
+- You detect *any* repeat as soon as it occurs.
+- Cycles are identified automatically and auditable via:
+  - `twin_iteration`
+  - `cycle_length`
+  - `repeat_at_iteration`
 
 ### Limits
 - Default: 19 iterations
