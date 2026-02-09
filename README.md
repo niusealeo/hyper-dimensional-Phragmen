@@ -10,7 +10,7 @@ This repository implements an **extended Sequential Phragmén election engine** 
 - explicit franchise-participation measurement (“projection”)  
 - deterministic iterative convergence under controlled interventions  
 
-It is intended for **research, simulation, and institutional design**, not as a drop-in replacement for statutory election software.
+This version is intended for **research, simulation, institutional design, and backyard club projects**, not as a drop-in replacement for statutory election software.
 
 ---
 
