@@ -1,5 +1,6 @@
 # Sequential Phragmén with Projection, Quota Floors, and Iterative Convergence
-"Modifiable iterative hyper-dimensional seq Phragmén"
+"Modifiable hyper-dimensional seq Phragmén"
+
 (authored with grunty fast coding assistance from ChatGPT)
 
 This repository implements an **extended Sequential Phragmén election engine** designed for large, heterogeneous electorates with:
