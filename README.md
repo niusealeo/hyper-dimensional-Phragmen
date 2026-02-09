@@ -1,5 +1,6 @@
 # Sequential Phragmén with Projection, Quota Floors, and Iterative Convergence
 "Modifiable iterative hyper-dimensional seq Phragmén"
+(authored with grunty fast coding assistance from ChatGPT)
 
 This repository implements an **extended Sequential Phragmén election engine** designed for large, heterogeneous electorates with:
 
@@ -240,13 +241,13 @@ Optional
 Interactive (default):
 
 ```bash
-python phragmen_seq.py election.json --outdir out
+python iterative_phragmen_seq.py election.json --outdir out
 ```
 
 Batch mode:
 
 ```bash
-python phragmen_seq.py election.json --no_prompt --max_iters 19
+python iterative_phragmen_seq.py election.json --no_prompt --max_iters 19
 ```
 ---
 
