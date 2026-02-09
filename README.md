@@ -109,7 +109,7 @@ This decouples:
 
 ---
 
-## 4. Iterative convergence process
+## 4. Iterative convergence and cyclic twin detection (signature mapping)
 
 The engine supports **controlled iterative reselection** using repeated Sequential Phragmén passes (A/B).
 
