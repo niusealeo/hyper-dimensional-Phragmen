@@ -12,7 +12,7 @@ WeightFn = Callable[[float], float]
 @dataclass(frozen=True)
 class Group:
     gid: str
-    kind: str  # "base" | "mega" | "party"
+    kind: str  # "base" | "party" | "electorate" | "mega"
     approvals: Tuple[str, ...]
     weight: float
     quota_floor: Optional[float] = None
