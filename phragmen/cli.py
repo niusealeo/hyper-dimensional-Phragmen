@@ -99,7 +99,7 @@ def select_pool_by_coverage(winners: List[str], intervals: List[Tuple[float, flo
 
 def prefix_until_projection_strict_gt(winners: List[str], intervals: List[Tuple[float, float]], target: float) -> List[str]:
     out: List[str] = []
-    for w, (p0, p1) in zip(winners, intervals):
+    for w, (_p0, p1) in zip(winners, intervals):
         out.append(w)
         if p1 > target + 1e-15:
             break
@@ -117,6 +117,7 @@ def run_sequential(
     base_groups: List[Group],
     mega_groups: List[Group],
     party_groups: List[Group],
+    electorate_groups: List[Group],
     party_lists: Dict[str, List[str]],
     stop_when_proj_gt: Optional[float],            # stop when p_total > threshold (strict)
     prefix_allow_only_init: Optional[List[str]],   # higher priority pool
@@ -126,13 +127,13 @@ def run_sequential(
     quota_csv_path: Optional[str],
     proj_csv_path: Optional[str],
 ) -> dict:
-    groups = base_groups + mega_groups + party_groups
+    groups = base_groups + mega_groups + party_groups + electorate_groups
     weights = [g.weight for g in groups]
     balances = [0.0 for _ in groups]
 
     supporters = build_supporters(groups, candidates)
     gid_to_index = {g.gid: i for i, g in enumerate(groups)}
-    quota_groups = [g for g in groups if g.kind in ("mega", "party")]
+    quota_groups = [g for g in groups if g.kind in ("mega", "party", "electorate")]
 
     total_voter_ballots = io_mod.total_normal_ballots_weight(base_groups)
     proj_total_for_quota = io_mod.projection_total_for_quota_from_base(base_groups)
@@ -311,6 +312,7 @@ def run_full_chamber_completion(
     base_groups: List[Group],
     mega_groups: List[Group],
     party_groups: List[Group],
+    electorate_groups: List[Group],
     party_lists: Dict[str, List[str]],
     prefix_allow: List[str],
     ban: Set[str],
@@ -322,13 +324,14 @@ def run_full_chamber_completion(
     quota_csv = os.path.join(outdir, f"{label}_quota.csv")
     proj_csv = os.path.join(outdir, f"{label}_projection.csv")
 
-    _res = run_sequential(
+    _ = run_sequential(
         label=label,
         candidates=candidates_list,
         seats=cap,
         base_groups=base_groups,
         mega_groups=mega_groups,
         party_groups=party_groups,
+        electorate_groups=electorate_groups,
         party_lists=party_lists,
         stop_when_proj_gt=None,
         prefix_allow_only_init=prefix_allow,
@@ -348,7 +351,6 @@ def run_full_chamber_completion(
             break
 
     if R2 is None:
-        # If infeasible to meet completion_target or seats, cap at what exists.
         R2 = len(winners)
 
     return {
@@ -369,10 +371,10 @@ def run_full_chamber_completion(
 # ---------------------------
 
 def main(argv: Optional[List[str]] = None) -> None:
-    ap = argparse.ArgumentParser(description="Sequential Phragmén (library layout) with profiles.")
+    ap = argparse.ArgumentParser(description="Sequential Phragmén (library layout) with profiles + electorates.")
     ap.add_argument("input_json", help="Election JSON file.")
     ap.add_argument("--outdir", default="out", help="Output directory for CSVs.")
-    ap.add_argument("--quota_meta_csv", default=None, help="Write normalized mega/party meta CSV (path).")
+    ap.add_argument("--quota_meta_csv", default=None, help="Write normalized mega/party/electorate meta CSV (path).")
     ap.add_argument("--max_iters", type=int, default=19, help="Max iterations INCLUDING the first pass.")
     ap.add_argument("--no_prompt", action="store_true",
                     help="Disable interactive prompts (profile selection + more-iters).")
@@ -397,17 +399,21 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     seats = int(data["seats"])
 
-    # Parse inputs via io layer (profile-aware scaling hooks)
+    # Parse base ballots (profile-aware)
     base_groups = io_mod.canonicalize_base_ballots(data.get("ballots", []), profile=profile)
     total_voter_ballots = io_mod.total_normal_ballots_weight(base_groups)
 
+    # Candidate meta
     candidate_meta = io_mod.parse_candidate_meta(data.get("candidate_meta") or {})
 
+    # Candidate universe: declared + base approvals
     candidates: Set[str] = set(str(c) for c in data.get("candidates", []))
     candidates.update(io_mod.candidates_from_groups(base_groups))
 
+    # Prefix intervention
     prefix_allow, ban = io_mod.parse_prefix_intervention(data)
 
+    # Party ballots (may add candidates)
     party_groups, party_lists, party_meta, party_cands = io_mod.parse_party_ballots(
         data.get("party_ballots", []),
         total_voter_ballots=total_voter_ballots,
@@ -415,6 +421,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     candidates.update(party_cands)
 
+    # Electorate defs may add candidates too (their registered list)
+    candidates.update(io_mod.extract_candidates_from_defs(data.get("electorate_ballots", [])))
+
+    # Now simplify mega + electorate against full candidate universe
     mega_groups, mega_meta = io_mod.parse_mega_ballots(
         data.get("mega_ballots", []),
         total_voter_ballots=total_voter_ballots,
@@ -423,10 +433,17 @@ def main(argv: Optional[List[str]] = None) -> None:
         profile=profile,
     )
 
+    electorate_groups, electorate_meta = io_mod.parse_electorate_ballots(
+        data.get("electorate_ballots", []),
+        total_voter_ballots=total_voter_ballots,
+        candidate_set=candidates,
+        profile=profile,
+    )
+
     candidates_list = sorted(candidates)
 
     if args.quota_meta_csv:
-        io_mod.write_meta_csv(args.quota_meta_csv, mega_meta + party_meta)
+        io_mod.write_meta_csv(args.quota_meta_csv, mega_meta + party_meta + electorate_meta)
 
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -443,6 +460,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         base_groups=base_groups,
         mega_groups=mega_groups,
         party_groups=party_groups,
+        electorate_groups=electorate_groups,
         party_lists=party_lists,
         stop_when_proj_gt=None,
         prefix_allow_only_init=prefix_allow,
@@ -490,6 +508,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 base_groups=base_groups,
                 mega_groups=mega_groups,
                 party_groups=party_groups,
+                electorate_groups=electorate_groups,
                 party_lists=party_lists,
                 stop_when_proj_gt=profile.sig_target,
                 prefix_allow_only_init=prefix_allow,
@@ -514,6 +533,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 base_groups=base_groups,
                 mega_groups=mega_groups,
                 party_groups=party_groups,
+                electorate_groups=electorate_groups,
                 party_lists=party_lists,
                 stop_when_proj_gt=profile.sig_target,
                 prefix_allow_only_init=prefix_allow,
@@ -563,6 +583,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             base_groups=base_groups,
             mega_groups=mega_groups,
             party_groups=party_groups,
+            electorate_groups=electorate_groups,
             party_lists=party_lists,
             prefix_allow=prefix_allow,
             ban=ban,
