@@ -308,7 +308,3 @@ def extract_candidates_from_defs(defs: List[dict]) -> Set[str]:
     for d in defs or []:
         s.update(str(x) for x in (d.get("candidates") or d.get("list") or []))
     return s
-
-
-def projection_seat_equiv(total_projection: float, seats: int) -> int:
-    return int(math.ceil(float(total_projection) * float(seats) - 1e-15))

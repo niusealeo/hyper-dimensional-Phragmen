@@ -14,6 +14,7 @@ ROUND_FIELDS = [
     "dt",
     "have",
     "rate",
+    # Franchise / projection
     "total_voter_ballots",
     "delta_voter_ballots_used",
     "delta_projection",
@@ -21,13 +22,14 @@ ROUND_FIELDS = [
     "used_voter_ballots_cum",
     "projection_interval_prev",
     "projection_interval_curr",
-    "r_eff",
-    "proj_seat_equiv",
+    # Quota activation bookkeeping
     "active_quota_groups",
+    # Intervention bookkeeping
     "prefix_allow_pool_size_before",
     "iter_allow_pool_size_before",
     "allow_pool_source",
     "allow_only_used",
+    # Settings snapshot
     "spend_mode",
     "dt0_tie_rule",
     "spend_tiers",
@@ -41,7 +43,7 @@ QUOTA_FIELDS = [
     "quota_gid",
     "quota_kind",
     "quota_floor",
-    "required_by_r_eff",
+    "required_by_round",
     "winners_in_set_before",
     "active_for_race",
     "reserve_balance_after",
@@ -94,20 +96,21 @@ def tie_break_by_party_order(tied_candidates: List[str], party_lists: Dict[str, 
     return best[1] if best is not None else min(tied_candidates)
 
 
-def quota_required(quota_floor: float, r_eff: int) -> int:
-    return int(math.ceil(quota_floor * r_eff - 1e-15))
+def quota_required(quota_floor: float, current_round: int) -> int:
+    return int(math.ceil(quota_floor * current_round - 1e-15))
 
 
 def compute_quota_active_info(
     quota_groups: List[Group],
     winners_so_far: List[str],
-    r_eff: int,
+    current_round: int,
 ) -> Dict[str, Tuple[bool, int, int]]:
+    """Quota activation is computed strictly at current_round (no projection look-ahead)."""
     info: Dict[str, Tuple[bool, int, int]] = {}
     winners_set = set(winners_so_far)
     for g in quota_groups:
         qf = float(g.quota_floor or 0.0)
-        req = quota_required(qf, r_eff)
+        req = quota_required(qf, current_round)
         if req <= 0:
             info[g.gid] = (False, 0, 0)
             continue

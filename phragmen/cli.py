@@ -159,11 +159,9 @@ def run_sequential(
     winners: List[str] = []
     winners_set: Set[str] = set()
 
-    # FIFO representation
     t_now = 0.0
     t_start = [0.0 for _ in groups]
 
-    # Legacy balances (debug-only)
     balances = [0.0 for _ in groups]
 
     def legacy_apply_time_step(dt: float) -> None:
@@ -181,12 +179,9 @@ def run_sequential(
             if not remaining:
                 break
 
-            proj_seat_equiv = io_mod.projection_seat_equiv(p_total, seats)
-            r_eff = max(r, proj_seat_equiv)
+            current_round = r
+            quota_info = compute_quota_active_info(quota_groups, winners, current_round)
 
-            quota_info = compute_quota_active_info(quota_groups, winners, r_eff)
-
-            # Active mask: base always active; quota groups only when unsatisfied
             active_mask = [True] * len(groups)
             for g in quota_groups:
                 active_mask[gid_to_index[g.gid]] = bool(quota_info[g.gid][0])
@@ -217,14 +212,12 @@ def run_sequential(
                 spend_mode=spend_mode,
             )
 
-            # advance time
             if spend_mode == "fifo_time_priority":
                 t_now += dt
             else:
                 legacy_apply_time_step(dt)
                 t_now += dt
 
-            # franchise accounting (base only, one-time)
             newly_used_ballots = compute_projection_delta_for_chosen(
                 chosen, groups, supporters, active_mask, base_used
             )
@@ -233,7 +226,6 @@ def run_sequential(
             p_total += delta_p
             used_voter_ballots_cum += newly_used_ballots
 
-            # spend
             if spend_mode == "fifo_time_priority":
                 spend_winner_fifo_time_priority_tiers(
                     cand=chosen,
@@ -257,7 +249,6 @@ def run_sequential(
             winners.append(chosen)
             winners_set.add(chosen)
 
-            # consume allow pools
             if pool_source == "prefix" and prefix_pool is not None and chosen in prefix_pool:
                 prefix_pool.remove(chosen)
                 if len(prefix_pool) == 0:
@@ -285,8 +276,6 @@ def run_sequential(
                     "used_voter_ballots_cum": f"{used_voter_ballots_cum:.6f}",
                     "projection_interval_prev": f"{p_prev:.12f}",
                     "projection_interval_curr": f"{p_total:.12f}",
-                    "r_eff": int(r_eff),
-                    "proj_seat_equiv": int(proj_seat_equiv),
                     "active_quota_groups": int(active_quota_groups),
                     "prefix_allow_pool_size_before": int(prefix_size_before),
                     "iter_allow_pool_size_before": int(iter_size_before),
@@ -323,7 +312,7 @@ def run_sequential(
                         "quota_gid": g.gid,
                         "quota_kind": g.kind,
                         "quota_floor": float(g.quota_floor or 0.0),
-                        "required_by_r_eff": int(req),
+                        "required_by_round": int(req),
                         "winners_in_set_before": int(in_set),
                         "active_for_race": bool(active),
                         "reserve_balance_after": float(bal_after),
