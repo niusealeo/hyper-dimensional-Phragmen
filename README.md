@@ -1,12 +1,9 @@
 # Sequential Phragmén with Projection, Quota Floors, and Iterative Convergence
-"Modifiable hyper-dimensional seq Phragmén"
-
-(authored with grunty fast coding assistance from ChatGPT)
 
 This repository implements an **extended Sequential Phragmén election engine** designed for large, heterogeneous electorates with:
 
 - weighted voter ballots  
-- quota-floor “mega ballots” and party ballots  
+- quota-floor “mega ballots”, electorate ballots, and party ballots  
 - explicit franchise-participation measurement (“projection”)  
 - deterministic iterative convergence under controlled interventions  
 
@@ -83,6 +80,10 @@ Party ballots are a special case of mega ballots:
 - They behave **exactly like mega ballots** in the credit race
 - Their candidate list is **not a ranking**
 - List order is used only to break ties between equal-time candidates
+
+### 2.4 Electorate ballots
+
+See description of electorate ballots at end of readme.
 
 ---
 
@@ -336,3 +337,86 @@ phragmen/
 iterative_phragmen_seq.py      # small entrypoint that calls phragmen.cli:main()
 README.md
 ```
+
+---
+
+## Electorate ballot groups
+
+This repo supports four ballot-group kinds:
+
+- **base**: voter approval ballots (canonicalized into identical approval groups)
+- **mega**: soft quota-floor reserve groups (identity / census / affinity blocs)
+- **party**: soft quota-floor reserve groups with an **ordered** party list used only for tie-breaks
+- **electorate**: soft quota-floor reserve groups that are **restricted to candidates registered in that electorate**
+
+### What an “electorate group” does (current behaviour)
+
+An electorate group behaves **the same as a mega/party quota group** in the current `general_alpha` profile:
+
+- It **earns credit** continuously during each round’s time step.
+- It is **active only when its quota proportion is unsatisfied** (soft racing condition).
+- When active, its credit + earning rate contributes to candidates it approves.
+- When the quota is satisfied, it continues to **accumulate reserve** but does **not** affect the sequential choice.
+- It is “spent” (its active supporters’ balances are reset) when a supported candidate wins.
+
+Electorate groups are kept as a separate kind so they can later receive electorate-specific rules (e.g. different activation criteria, local seat targets, priority rules) without changing mega/party behaviour.
+
+### Input JSON schema
+
+Add an optional top-level array:
+
+```json
+{
+  "electorate_ballots": [
+    {
+      "id": "E:Wellington",
+      "population": 59899,
+      "abs_weight": 59899,
+      "candidates": ["cand_1", "cand_2", "cand_3"]
+    }
+  ]
+}
+```
+Electorate groups may also be defined directly by a quota floor:
+```json
+{
+  "electorate_ballots": [
+    {
+      "id": "E:Wellington",
+      "quota_floor": 0.25,
+      "candidates": ["cand_1", "cand_2", "cand_3"]
+    }
+  ]
+}
+```
+
+Notes:
+- `candidates` (or `approvals`) is the electorate’s **registered candidate list**.
+- This list is **simplified** to the global candidate universe.
+- If an electorate group ends up with zero eligible approvals after simplification, it is dropped.
+
+### Weight normalisation and quota-floor derivation
+
+Electorate groups accept the same construction modes as mega/party:
+- **(abs_weight, population)** mode:
+    - `share = abs_weight / population`
+    - `rel_weight = share * sum(voter_ballots_weight)`
+    - `quota_floor = min((2/3)*share, 1/3)`
+- **quota_floor** mode:
+    - the code derives `share` by inverting the above rule
+    - and then computes `rel_weight = share * sum(voter_ballots_weight)`
+
+In `general_alpha` the profile scaling functions are identity, but future profiles can scale electorate weights differently.
+
+### Outputs
+
+If `--quota_meta_csv` is set, the tool writes a meta CSV that includes:
+- mega groups
+- party groups
+- electorate groups
+
+Each row reports (where applicable):
+- population, abs_weight, share, rel_weight
+- quota_floor
+- approvals size (after simplification)
+- whether the group was dropped from the algorithm
