@@ -8,7 +8,7 @@ EPS = 1e-12
 
 WeightFn = Callable[[float], float]
 
-SpendMode = Literal["reset", "partial_priority"]
+SpendMode = Literal["reset", "partial_priority", "fifo_time_priority"]
 DT0TieRule = Literal["party_then_name", "max_have_then_party_then_name"]
 
 
