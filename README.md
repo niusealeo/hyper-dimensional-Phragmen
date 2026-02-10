@@ -420,3 +420,58 @@ Each row reports (where applicable):
 - quota_floor
 - approvals size (after simplification)
 - whether the group was dropped from the algorithm
+
+---
+
+## FIFO spend mode (time-priority) and cutoff τ
+
+This repo supports a **FIFO spend mode** for sequential Phragmén-style credit accounting:
+
+- Each approval group `g` has a constant earning rate `w_g` (its weight).
+- Instead of “resetting balances”, FIFO mode treats each group’s unspent credit as **credit accrued over time since its last spend**.
+- A group stores only a single timestamp `t_start[g]` meaning: *the start time of its currently-unspent credit interval*.
+
+At global algorithm time `t_now`, the group’s spendable credit is:
+
+\[
+B_g(t_{now}) = w_g \cdot \max(0, t_{now} - t_{start,g})
+\]
+
+### Spending 1 seat value by FIFO
+
+When a candidate wins, we spend **exactly 1.0** of credit (unless infeasible) using **oldest credit first**.
+
+For a given set of paying groups `S`, FIFO spending is defined by finding a **cutoff time** \( \tau \le t_{now} \) such that:
+
+\[
+\sum_{g \in S} w_g \cdot \max(0, \tau - t_{start,g}) = 1
+\]
+
+This sum is a piecewise-linear function of \( \tau \). We solve it efficiently by sorting the `t_start` values and sweeping segments until the equation reaches 1.
+
+Once \( \tau \) is found:
+
+- Each paying group with `t_start[g] < τ` advances its `t_start[g]` up to `τ` (consuming its oldest credit first).
+- Any credit accrued **after τ** remains intact automatically (FIFO leftovers).
+- If a tier cannot cover the remaining amount, its groups are fully drained by setting `t_start[g] = t_now`.
+
+This “cutoff τ” logic reproduces the behaviour seen in the Approval Scorecard examples:
+earlier-accrued credit can fund a later winner **without touching** newer credit that began accruing after some groups were reset/spent in intervening rounds.
+
+### Tiered priority spending
+
+FIFO spending supports **priority tiers** across group kinds (and optional grouping of kinds in the same tier):
+
+- Default: `base>electorate>party>mega`
+- Example: `base>party>electorate,mega` (electorate + mega treated as one tier)
+
+Within a tier containing multiple kinds, the default is **combined FIFO**:
+all groups in that tier are pooled and a single cutoff \( \tau \) is computed for the tier.
+
+You can override tiers on the CLI:
+
+```bash
+python -m phragmen.cli election.json \
+  --spend_mode fifo_time_priority \
+  --spend_tiers "base>party>electorate,mega" \
+  --tier_within_mode combined_fifo
