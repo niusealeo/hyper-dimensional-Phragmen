@@ -10,9 +10,9 @@ import os
 from . import io as io_mod
 from .engine import (
     ROUND_FIELDS, QUOTA_FIELDS, PROJ_FIELDS,
-    apply_time_step, build_supporters, choose_candidate_for_round,
+    build_supporters, choose_candidate_for_round,
     compute_projection_delta_for_chosen, compute_quota_active_info,
-    spend_winner_reset, spend_winner_partial_priority,
+    spend_winner_reset, spend_winner_fifo_time_priority, fifo_balance_at,
 )
 from .profiles import get_profile, list_profiles
 from .types import ElectionProfile, Group
@@ -115,7 +115,6 @@ def run_sequential(
 ) -> dict:
     groups = base_groups + mega_groups + party_groups + electorate_groups
     weights = [g.weight for g in groups]
-    balances = [0.0 for _ in groups]
 
     supporters = build_supporters(groups, candidates)
     gid_to_index = {g.gid: i for i, g in enumerate(groups)}
@@ -144,7 +143,21 @@ def run_sequential(
 
     winners: List[str] = []
     winners_set: Set[str] = set()
-    time_now = 0.0
+
+    # Representation:
+    # - reset/partial_priority modes would use balances; FIFO uses (t_now, t_start)
+    # For FIFO, balances are derived: balance_i = w_i * (t_now - t_start_i)
+    t_now = 0.0
+    t_start = [0.0 for _ in groups]  # all start accruing at time 0 unless later moved by FIFO spend
+
+    # Legacy balances only used if not FIFO
+    balances = [0.0 for _ in groups]
+
+    def legacy_apply_time_step(dt: float) -> None:
+        if dt <= 0:
+            return
+        for i in range(len(balances)):
+            balances[i] += dt * weights[i]
 
     try:
         for r in range(1, seats + 1):
@@ -177,15 +190,25 @@ def run_sequential(
                 pool_source = "iter"
 
             chosen, dt, have, rate, allow_used = choose_candidate_for_round(
-                remaining,
-                balances, weights, supporters, active_mask,
-                party_lists,
+                remaining=remaining,
+                balances=None if spend_mode == "fifo_time_priority" else balances,
+                t_now=t_now if spend_mode == "fifo_time_priority" else None,
+                t_start=t_start if spend_mode == "fifo_time_priority" else None,
+                weights=weights,
+                supporters=supporters,
+                active_mask=active_mask,
+                party_lists=party_lists,
                 allow_only_pool=pool_to_use,
                 dt0_tie_rule=dt0_tie_rule,
+                spend_mode=spend_mode,
             )
 
-            apply_time_step(balances, weights, dt)
-            time_now += dt
+            # Advance time
+            if spend_mode == "fifo_time_priority":
+                t_now += dt
+            else:
+                legacy_apply_time_step(dt)
+                t_now += dt  # keep t_now consistent for logging
 
             newly_used_ballots = compute_projection_delta_for_chosen(
                 chosen, groups, supporters, active_mask, base_used
@@ -196,22 +219,30 @@ def run_sequential(
             p_total += delta_p
             used_voter_ballots_cum += newly_used_ballots
 
-            # Spend winner according to mode
-            if spend_mode == "reset":
-                spend_winner_reset(chosen, groups, balances, supporters, active_mask)
-            else:
-                spend_winner_partial_priority(
-                    chosen,
-                    groups,
-                    balances,
-                    supporters,
-                    active_mask,
+            # Spend
+            if spend_mode == "fifo_time_priority":
+                spend_winner_fifo_time_priority(
+                    cand=chosen,
+                    groups=groups,
+                    t_now=t_now,
+                    t_start=t_start,
+                    weights=weights,
+                    supporters=supporters,
+                    active_mask=active_mask,
                     priority=["base", "electorate", "party", "mega"],
+                )
+            else:
+                spend_winner_reset(
+                    cand=chosen,
+                    balances=balances,
+                    supporters=supporters,
+                    active_mask=active_mask,
                 )
 
             winners.append(chosen)
             winners_set.add(chosen)
 
+            # Consume allow pools
             if pool_source == "prefix" and prefix_pool is not None and chosen in prefix_pool:
                 prefix_pool.remove(chosen)
                 if len(prefix_pool) == 0:
@@ -228,7 +259,7 @@ def run_sequential(
                     "label": label,
                     "round": r,
                     "chosen": chosen,
-                    "time": f"{time_now:.12f}",
+                    "time": f"{t_now:.12f}",
                     "dt": f"{dt:.12f}",
                     "have": f"{have:.12f}",
                     "rate": f"{rate:.12f}",
@@ -268,6 +299,11 @@ def run_sequential(
                 for g in quota_groups:
                     active, in_set, req = quota_info[g.gid]
                     gi = gid_to_index[g.gid]
+                    if spend_mode == "fifo_time_priority":
+                        bal_after = fifo_balance_at(t_now, t_start, weights, gi)
+                    else:
+                        bal_after = balances[gi]
+
                     quota_w.writerow({
                         "label": label,
                         "round": r,
@@ -278,7 +314,7 @@ def run_sequential(
                         "required_by_r_eff": int(req),
                         "winners_in_set_before": int(in_set),
                         "active_for_race": bool(active),
-                        "reserve_balance_after": float(balances[gi]),
+                        "reserve_balance_after": float(bal_after),
                         "rel_weight": float(g.weight),
                         "abs_weight": float(g.abs_weight or 0.0),
                         "population": float(g.population or 0.0),
@@ -298,7 +334,7 @@ def run_sequential(
     return {
         "label": label,
         "winners": winners,
-        "final_time": time_now,
+        "final_time": t_now,
         "final_projection": p_total,
         "stopped_at_round": len(winners),
         "total_voter_ballots": total_voter_ballots,
@@ -372,7 +408,7 @@ def run_full_chamber_completion(
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    ap = argparse.ArgumentParser(description="Sequential Phragmén (profiles + electorates + overshoot spending).")
+    ap = argparse.ArgumentParser(description="Sequential Phragmén (profiles + electorates + FIFO spending).")
     ap.add_argument("input_json", help="Election JSON file.")
     ap.add_argument("--outdir", default="out", help="Output directory for CSVs.")
     ap.add_argument("--quota_meta_csv", default=None, help="Write normalized mega/party/electorate meta CSV (path).")
@@ -382,8 +418,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     ap.add_argument("--profile", default=None,
                     help="Profile key (e.g. general_alpha). If omitted, prompt (unless --no_prompt).")
 
-    # Explicit knobs (override profile defaults)
-    ap.add_argument("--spend_mode", choices=["reset", "partial_priority"], default=None,
+    ap.add_argument("--spend_mode", choices=["reset", "partial_priority", "fifo_time_priority"], default=None,
                     help="How to spend balances on election. Overrides profile.")
     ap.add_argument("--dt0_tie_rule", choices=["party_then_name", "max_have_then_party_then_name"], default=None,
                     help="How to break dt=0 ties. Overrides profile.")
@@ -443,6 +478,8 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     os.makedirs(args.outdir, exist_ok=True)
 
+    # --- PASS/ITERATION LOGIC ---
+    # (unchanged from your previous version; only run_sequential signature changed)
     pass1_label = "pass01"
     pass1_rounds = os.path.join(args.outdir, f"{pass1_label}_rounds.csv")
     pass1_quota = os.path.join(args.outdir, f"{pass1_label}_quota.csv")
