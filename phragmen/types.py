@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Tuple, Literal
 
 
 EPS = 1e-12
 
 WeightFn = Callable[[float], float]
+
+SpendMode = Literal["reset", "partial_priority"]
+DT0TieRule = Literal["party_then_name", "max_have_then_party_then_name"]
 
 
 @dataclass(frozen=True)
@@ -26,8 +29,6 @@ class ElectionProfile:
     """
     Election 'settings bundle' (profile) that can later define scaling rules
     without touching the calculation engine.
-
-    For now (general_alpha), these are identity functions.
     """
     key: str
     name: str
@@ -42,6 +43,10 @@ class ElectionProfile:
     # Thresholds (strict comparisons are used: > target)
     sig_target: float
     completion_target: float
+
+    # Overshoot + dt=0 controls
+    spend_mode: SpendMode
+    dt0_tie_rule: DT0TieRule
 
     # UX
     prompt_block: int
