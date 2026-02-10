@@ -1,15 +1,11 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import math
 
 from .types import EPS, Group
 
-
-# ---------------------------
-# CSV schemas (shared with CLI)
-# ---------------------------
 
 ROUND_FIELDS = [
     "label",
@@ -34,6 +30,8 @@ ROUND_FIELDS = [
     "iter_allow_pool_size_before",
     "allow_pool_source",
     "allow_only_used",
+    "spend_mode",
+    "dt0_tie_rule",
 ]
 
 QUOTA_FIELDS = [
@@ -64,10 +62,6 @@ PROJ_FIELDS = [
     "used_voter_ballots_cum",
 ]
 
-
-# ---------------------------
-# Mechanics
-# ---------------------------
 
 def build_supporters(groups: List[Group], candidates: List[str]) -> Dict[str, List[int]]:
     idx: Dict[str, List[int]] = {c: [] for c in candidates}
@@ -126,12 +120,6 @@ def candidate_dt(
     return ((1.0 - have) / rate, have, rate)
 
 
-def spend_winner(cand: str, balances: List[float], supporters: Dict[str, List[int]], active_mask: List[bool]) -> None:
-    for gi in supporters.get(cand, []):
-        if active_mask[gi]:
-            balances[gi] = 0.0
-
-
 def party_rank_maps(party_lists: Dict[str, List[str]]) -> Dict[str, Dict[str, int]]:
     return {pid: {c: i for i, c in enumerate(lst)} for pid, lst in party_lists.items()}
 
@@ -161,7 +149,13 @@ def choose_candidate_for_round(
     active_mask: List[bool],
     party_lists: Dict[str, List[str]],
     allow_only_pool: Optional[Set[str]] = None,
+    dt0_tie_rule: str = "party_then_name",
 ) -> Tuple[str, float, float, float, bool]:
+    """
+    Select by minimum dt as usual.
+    Special: if best dt == 0 and dt0_tie_rule = max_have_then_party_then_name,
+    choose among dt==0 ties the candidate with greatest 'have' first.
+    """
     allow_used = False
     if allow_only_pool is not None and len(allow_only_pool) > 0:
         filtered = [c for c in remaining if c in allow_only_pool]
@@ -185,15 +179,39 @@ def choose_candidate_for_round(
 
     scored.sort(key=lambda x: (x[0], x[1]))
     best_dt = scored[0][0]
-    tied = [c for (dt, c, _, _) in scored if abs(dt - best_dt) <= 1e-12]
+    tied = [(dt, c, have, rate) for (dt, c, have, rate) in scored if abs(dt - best_dt) <= 1e-12]
 
-    if len(tied) > 1:
-        chosen = tie_break_by_party_order(tied, party_lists)
-        for dt, c, have, rate in scored:
-            if c == chosen and abs(dt - best_dt) <= 1e-12:
-                return chosen, dt, have, rate, allow_used
+    if len(tied) == 1:
+        dt, c, have, rate = tied[0]
+        return c, dt, have, rate, allow_used
 
-    dt, chosen, have, rate = scored[0]
+    tied_candidates = [c for (_dt, c, _have, _rate) in tied]
+
+    if abs(best_dt) <= 1e-12 and dt0_tie_rule == "max_have_then_party_then_name":
+        # Pick candidate with greatest available spending balance ('have') first.
+        max_have = max(h for (_dt, _c, h, _r) in tied)
+        tied2 = [t for t in tied if abs(t[2] - max_have) <= 1e-12]
+        if len(tied2) == 1:
+            dt, c, have, rate = tied2[0]
+            return c, dt, have, rate, allow_used
+        tied_candidates2 = [c for (_dt, c, _have, _rate) in tied2]
+        chosen = tie_break_by_party_order(tied_candidates2, party_lists)
+        for dt, c, have, rate in tied2:
+            if c == chosen:
+                return c, dt, have, rate, allow_used
+        chosen = min(tied_candidates2)
+        for dt, c, have, rate in tied2:
+            if c == chosen:
+                return c, dt, have, rate, allow_used
+
+    # Default: party tie-break then name
+    chosen = tie_break_by_party_order(tied_candidates, party_lists)
+    # Return its tuple
+    for dt, c, have, rate in tied:
+        if c == chosen:
+            return c, dt, have, rate, allow_used
+
+    dt, chosen, have, rate = tied[0]
     return chosen, dt, have, rate, allow_used
 
 
@@ -215,3 +233,86 @@ def compute_projection_delta_for_chosen(
         newly_used += groups[gi].weight
         base_used[gi] = True
     return newly_used
+
+
+def spend_winner_reset(
+    cand: str,
+    groups: List[Group],
+    balances: List[float],
+    supporters: Dict[str, List[int]],
+    active_mask: List[bool],
+) -> None:
+    """
+    Old behaviour: reset all active supporters' balances to 0.
+    Dormant quota balances are not touched because active_mask is False for them.
+    """
+    for gi in supporters.get(cand, []):
+        if active_mask[gi]:
+            balances[gi] = 0.0
+
+
+def _spend_from_indices_proportional(balances: List[float], indices: List[int], amount: float) -> float:
+    """
+    Spend up to 'amount' from balances[indices], proportionally.
+    Returns the amount actually spent (<= amount).
+    """
+    if amount <= 0:
+        return 0.0
+    total = sum(max(balances[i], 0.0) for i in indices)
+    if total <= EPS:
+        return 0.0
+    if total <= amount + EPS:
+        # take all
+        for i in indices:
+            balances[i] = 0.0
+        return total
+    # partial proportional
+    frac = (amount / total)
+    for i in indices:
+        b = max(balances[i], 0.0)
+        balances[i] = b * (1.0 - frac)
+    return amount
+
+
+def spend_winner_partial_priority(
+    cand: str,
+    groups: List[Group],
+    balances: List[float],
+    supporters: Dict[str, List[int]],
+    active_mask: List[bool],
+    priority: List[str],
+) -> None:
+    """
+    Spend EXACTLY 1 seat value (or as much as possible if infeasible),
+    preserving overshoot leftovers.
+
+    Priority order (your spec):
+      base → electorate → party → mega
+
+    Rules:
+      - Only groups with active_mask True are spendable this round
+        (so dormant quota reserves remain untouched).
+      - Within each kind, spending is proportional if partial.
+    """
+    need = 1.0
+
+    # Partition supporter indices by kind, respecting active_mask
+    by_kind: Dict[str, List[int]] = {k: [] for k in priority}
+    for gi in supporters.get(cand, []):
+        if not active_mask[gi]:
+            continue
+        k = groups[gi].kind
+        if k in by_kind:
+            by_kind[k].append(gi)
+
+    for k in priority:
+        if need <= EPS:
+            break
+        idxs = by_kind.get(k, [])
+        if not idxs:
+            continue
+        spent = _spend_from_indices_proportional(balances, idxs, need)
+        need -= spent
+
+    # If need > 0 here, it means: despite dt=0 or dt>0, the active supporters couldn't cover 1.
+    # That should be rare (and indicates inconsistent dt computation), but we fail safe by not going negative.
