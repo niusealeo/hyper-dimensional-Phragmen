@@ -12,9 +12,9 @@ WeightFn = Callable[[float], float]
 # Spending modes supported by the engine.
 SpendMode = Literal[
     "reset",
-    "partial_priority",
     "fifo_time_priority",
 ]
+#   "partial_priority",
 
 # dt=0 tie-breaking modes.
 DT0TieRule = Literal[
@@ -58,6 +58,7 @@ class Group:
     population: Optional[float] = None
     abs_weight: Optional[float] = None
     share: Optional[float] = None
+    meta: Optional[dict] = None
 
 
 @dataclass(frozen=True)
