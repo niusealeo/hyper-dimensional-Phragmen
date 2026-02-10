@@ -370,7 +370,7 @@ Add an optional top-level array:
   "electorate_ballots": [
     {
       "id": "E:Wellington",
-      "population": 59899,
+      "population": 3500250,
       "abs_weight": 59899,
       "candidates": ["cand_1", "cand_2", "cand_3"]
     }
