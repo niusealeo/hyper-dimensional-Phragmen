@@ -1,24 +1,42 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Set, Tuple
-
+from typing import Dict, List, Optional, Set, Tuple, Any
+from collections import defaultdict
 import csv
 import math
-import os
 
-from .types import ElectionProfile, Group
+from .types import Group, ElectionProfile
 
 
-# ---------------------------
-# Small utilities
-# ---------------------------
+def _canon_approvals(seq: List[str]) -> Tuple[str, ...]:
+    return tuple(sorted(set(str(x) for x in seq if str(x).strip() != "")))
 
-def canon_set(xs: List[str]) -> Tuple[str, ...]:
-    return tuple(sorted(set(str(x) for x in xs)))
+
+def canonicalize_base_ballots(ballots: List[dict], profile: ElectionProfile) -> List[Group]:
+    agg: Dict[Tuple[str, ...], float] = defaultdict(float)
+    for b in ballots or []:
+        apps = _canon_approvals(b.get("approvals", []))
+        w = float(b.get("weight", 1.0))
+        if w <= 0 or not apps:
+            continue
+        agg[apps] += w
+
+    out: List[Group] = []
+    for i, (apps, w) in enumerate(sorted(agg.items(), key=lambda x: (-x[1], x[0]))):
+        out.append(
+            Group(
+                gid=f"base_{i}",
+                kind="base",
+                approvals=apps,
+                weight=profile.scale_base_weight(w),
+                meta={"raw_weight": w, "approvals_size": len(apps)},
+            )
+        )
+    return out
 
 
 def total_normal_ballots_weight(base_groups: List[Group]) -> float:
-    return float(sum(g.weight for g in base_groups))
+    return sum(g.weight for g in base_groups)
 
 
 def candidates_from_groups(groups: List[Group]) -> Set[str]:
@@ -28,466 +46,269 @@ def candidates_from_groups(groups: List[Group]) -> Set[str]:
     return s
 
 
-def extract_candidates_from_defs(raw_defs: List[dict]) -> Set[str]:
-    """
-    Extract candidate names from list definitions that may store candidates under:
-      - "candidates"
-      - "approvals"
-    Used for party + electorate candidate universe expansion before simplification.
-    """
-    out: Set[str] = set()
-    for d in raw_defs or []:
-        xs = d.get("candidates", d.get("approvals", [])) or []
-        for c in xs:
-            out.add(str(c))
+def parse_candidate_meta(obj: dict) -> Dict[str, dict]:
+    out: Dict[str, dict] = {}
+    for k, v in (obj or {}).items():
+        if isinstance(v, dict):
+            out[str(k)] = v
     return out
 
 
-def write_meta_csv(path: str, rows: List[dict]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    keys: List[str] = []
-    for r in rows:
-        for k in r.keys():
-            if k not in keys:
-                keys.append(k)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
-
-# ---------------------------
-# Candidate meta / auto include
-# ---------------------------
-
-def parse_candidate_meta(raw: dict) -> Dict[str, Dict[str, Set[str]]]:
-    meta: Dict[str, Dict[str, Set[str]]] = {}
-    for cand, m in (raw or {}).items():
-        c = str(cand)
-        groups = set(str(x) for x in (m.get("groups") or []))
-        tags = set(str(x) for x in (m.get("tags") or []))
-        meta[c] = {"groups": groups, "tags": tags}
-    return meta
-
-
-def auto_include_candidates(
-    candidate_set: Set[str],
-    candidate_meta: Dict[str, Dict[str, Set[str]]],
-    auto_include: Optional[dict],
-) -> Set[str]:
-    if not auto_include:
+def candidates_matching_meta(candidate_meta: Dict[str, dict], where: Dict[str, Any]) -> Set[str]:
+    if not where:
         return set()
 
-    want_groups = set(str(x) for x in (auto_include.get("groups_any") or []))
-    want_tags = set(str(x) for x in (auto_include.get("tags_any") or []))
-
-    out: Set[str] = set()
-    for c in candidate_set:
-        m = candidate_meta.get(c)
-        if not m:
-            continue
-        if want_groups and (m["groups"] & want_groups):
-            out.add(c)
-            continue
-        if want_tags and (m["tags"] & want_tags):
-            out.add(c)
-            continue
-    return out
-
-
-# ---------------------------
-# Quota-floor math
-# ---------------------------
-
-def projection_total_for_quota_from_base(base_groups: List[Group]) -> int:
-    tot = total_normal_ballots_weight(base_groups)
-    return int(math.ceil((2.0 / 3.0) * tot - 1e-15))
-
-
-def derive_quota_and_rel_weight_from_abs(
-    abs_weight: float,
-    population: float,
-    total_voter_ballots: float
-) -> Tuple[float, float, float]:
-    if population <= 0:
-        raise ValueError("population must be > 0")
-    share = abs_weight / population
-    rel_weight = share * total_voter_ballots
-    quota_floor = min((2.0 / 3.0) * share, 1.0 / 3.0)
-    return share, rel_weight, quota_floor
-
-
-def invert_share_from_quota_floor(qf: float) -> Tuple[float, bool]:
-    if qf < (1.0 / 3.0) - 1e-15:
-        return 1.5 * qf, False
-    return 0.5, True
-
-
-# ---------------------------
-# Base ballots
-# ---------------------------
-
-def canonicalize_base_ballots(raw_ballots: List[dict], profile: ElectionProfile) -> List[Group]:
-    agg: Dict[Tuple[str, ...], float] = {}
-    for b in raw_ballots or []:
-        approvals = canon_set(b.get("approvals", []))
-        if not approvals:
-            continue
-        w = float(b.get("weight", 1.0))
-        w = float(profile.scale_base_weight(w))
-        if w <= 0:
-            continue
-        agg[approvals] = agg.get(approvals, 0.0) + w
-
-    groups: List[Group] = []
-    for i, (appr, wsum) in enumerate(agg.items()):
-        groups.append(Group(gid=f"B:{i}", kind="base", approvals=appr, weight=wsum))
-    return groups
-
-
-# ---------------------------
-# Party ballots
-# ---------------------------
-
-def parse_party_ballots(
-    raw_parties: List[dict],
-    total_voter_ballots: float,
-    profile: ElectionProfile,
-) -> Tuple[List[Group], Dict[str, List[str]], List[dict], Set[str]]:
-    groups: List[Group] = []
-    party_lists: Dict[str, List[str]] = {}
-    meta_rows: List[dict] = []
-    party_cands: Set[str] = set()
-
-    for i, p in enumerate(raw_parties or []):
-        gid = str(p.get("id", f"P:{i}"))
-
-        quota_floor = p.get("quota_floor", None)
-        abs_weight = p.get("abs_weight", p.get("weight", None))
-        population = p.get("population", None)
-
-        share = None
-        rel_weight = None
-        derived_mode = None
-        saturation_assumed = False
-        pop_val = None
-        abs_val = None
-
-        if quota_floor is not None:
-            qf = float(quota_floor)
-            if qf <= 0:
-                continue
-            share, saturation_assumed = invert_share_from_quota_floor(qf)
-            rel_weight = share * total_voter_ballots
-            derived_mode = "quota_floor"
-            if population is not None:
-                pop_val = float(population)
-                abs_val = float(abs_weight) if abs_weight is not None else (share * pop_val)
+    matched: Set[str] = set()
+    for cand, meta in candidate_meta.items():
+        ok = True
+        for key, want in where.items():
+            if key not in meta:
+                ok = False
+                break
+            have = meta[key]
+            if isinstance(want, (list, tuple, set)):
+                want_set = set(want)
+                if isinstance(have, (list, tuple, set)):
+                    if not (set(have) & want_set):
+                        ok = False
+                        break
+                else:
+                    if have not in want_set:
+                        ok = False
+                        break
             else:
-                pop_val = None
-                abs_val = float(abs_weight) if abs_weight is not None else None
-            quota_floor = qf
-        else:
-            if abs_weight is None or population is None:
-                continue
-            abs_val = float(abs_weight)
-            pop_val = float(population)
-            if abs_val <= 0 or pop_val <= 0:
-                continue
-            share, rel_weight, qf = derive_quota_and_rel_weight_from_abs(abs_val, pop_val, total_voter_ballots)
-            quota_floor = qf
-            derived_mode = "abs_weight_population"
-            saturation_assumed = (abs(qf - (1.0 / 3.0)) <= 1e-12)
+                if isinstance(have, (list, tuple, set)):
+                    if want not in set(have):
+                        ok = False
+                        break
+                else:
+                    if have != want:
+                        ok = False
+                        break
+        if ok:
+            matched.add(cand)
+    return matched
 
-        rel_weight = float(profile.scale_party_rel_weight(float(rel_weight)))
-
-        ordered_raw = p.get("candidates", p.get("approvals", []))
-        ordered = [str(x) for x in (ordered_raw or [])]
-
-        seen: Set[str] = set()
-        ordered_dedup: List[str] = []
-        for c in ordered:
-            if c not in seen:
-                seen.add(c)
-                ordered_dedup.append(c)
-
-        if not ordered_dedup:
-            meta_rows.append({
-                "id": gid, "kind": "party",
-                "mode": derived_mode,
-                "population": pop_val if pop_val is not None else "",
-                "abs_weight": abs_val if abs_val is not None else "",
-                "share": share,
-                "rel_weight": rel_weight,
-                "quota_floor": quota_floor,
-                "party_list_len": 0,
-                "approvals_simplified": 0,
-                "saturation_assumed_min_share": saturation_assumed,
-                "dropped_from_algorithm": True,
-            })
-            continue
-
-        party_lists[gid] = ordered_dedup
-        party_cands.update(ordered_dedup)
-
-        approvals = tuple(sorted(set(ordered_dedup)))
-        groups.append(Group(
-            gid=gid, kind="party",
-            approvals=approvals,
-            weight=float(rel_weight),
-            quota_floor=float(quota_floor),
-            population=float(pop_val) if pop_val is not None else None,
-            abs_weight=float(abs_val) if abs_val is not None else None,
-            share=float(share) if share is not None else None,
-        ))
-
-        meta_rows.append({
-            "id": gid, "kind": "party",
-            "mode": derived_mode,
-            "population": pop_val if pop_val is not None else "",
-            "abs_weight": abs_val if abs_val is not None else "",
-            "share": share,
-            "rel_weight": rel_weight,
-            "quota_floor": quota_floor,
-            "party_list_len": len(ordered_dedup),
-            "approvals_simplified": len(approvals),
-            "saturation_assumed_min_share": saturation_assumed,
-            "dropped_from_algorithm": False,
-        })
-
-    return groups, party_lists, meta_rows, party_cands
-
-
-# ---------------------------
-# Mega ballots
-# ---------------------------
-
-def parse_mega_ballots(
-    raw_megas: List[dict],
-    total_voter_ballots: float,
-    candidate_set: Set[str],
-    candidate_meta: Dict[str, Dict[str, Set[str]]],
-    profile: ElectionProfile,
-) -> Tuple[List[Group], List[dict]]:
-    groups: List[Group] = []
-    meta_rows: List[dict] = []
-
-    for i, m in enumerate(raw_megas or []):
-        gid = str(m.get("id", f"M:{i}"))
-
-        quota_floor = m.get("quota_floor", None)
-        abs_weight = m.get("abs_weight", m.get("weight", None))
-        population = m.get("population", None)
-
-        share = None
-        rel_weight = None
-        derived_mode = None
-        saturation_assumed = False
-        pop_val = None
-        abs_val = None
-
-        if quota_floor is not None:
-            qf = float(quota_floor)
-            if qf <= 0:
-                continue
-            share, saturation_assumed = invert_share_from_quota_floor(qf)
-            rel_weight = share * total_voter_ballots
-            derived_mode = "quota_floor"
-            if population is not None:
-                pop_val = float(population)
-                abs_val = float(abs_weight) if abs_weight is not None else (share * pop_val)
-            else:
-                pop_val = None
-                abs_val = float(abs_weight) if abs_weight is not None else None
-            quota_floor = qf
-        else:
-            if abs_weight is None or population is None:
-                continue
-            abs_val = float(abs_weight)
-            pop_val = float(population)
-            if abs_val <= 0 or pop_val <= 0:
-                continue
-            share, rel_weight, qf = derive_quota_and_rel_weight_from_abs(abs_val, pop_val, total_voter_ballots)
-            quota_floor = qf
-            derived_mode = "abs_weight_population"
-            saturation_assumed = (abs(qf - (1.0 / 3.0)) <= 1e-12)
-
-        rel_weight = float(profile.scale_mega_rel_weight(float(rel_weight)))
-
-        manual = set(str(x) for x in (m.get("approvals") or []))
-        auto = auto_include_candidates(candidate_set, candidate_meta, m.get("auto_include"))
-        approvals = sorted((manual | auto) & candidate_set)
-
-        if len(approvals) == 0:
-            meta_rows.append({
-                "id": gid, "kind": "mega",
-                "mode": derived_mode,
-                "population": pop_val if pop_val is not None else "",
-                "abs_weight": abs_val if abs_val is not None else "",
-                "share": share,
-                "rel_weight": rel_weight,
-                "quota_floor": quota_floor,
-                "approvals_original": len(manual),
-                "approvals_auto": len(auto),
-                "approvals_simplified": 0,
-                "saturation_assumed_min_share": saturation_assumed,
-                "dropped_from_algorithm": True,
-            })
-            continue
-
-        groups.append(Group(
-            gid=gid, kind="mega",
-            approvals=tuple(approvals),
-            weight=float(rel_weight),
-            quota_floor=float(quota_floor),
-            population=float(pop_val) if pop_val is not None else None,
-            abs_weight=float(abs_val) if abs_val is not None else None,
-            share=float(share) if share is not None else None,
-        ))
-
-        meta_rows.append({
-            "id": gid, "kind": "mega",
-            "mode": derived_mode,
-            "population": pop_val if pop_val is not None else "",
-            "abs_weight": abs_val if abs_val is not None else "",
-            "share": share,
-            "rel_weight": rel_weight,
-            "quota_floor": quota_floor,
-            "approvals_original": len(manual),
-            "approvals_auto": len(auto),
-            "approvals_simplified": len(approvals),
-            "saturation_assumed_min_share": saturation_assumed,
-            "dropped_from_algorithm": False,
-        })
-
-    return groups, meta_rows
-
-
-# ---------------------------
-# Electorate ballots
-# ---------------------------
-
-def parse_electorate_ballots(
-    raw_electorates: List[dict],
-    total_voter_ballots: float,
-    candidate_set: Set[str],
-    profile: ElectionProfile,
-) -> Tuple[List[Group], List[dict]]:
-    """
-    Electorate ballot groups:
-      - behave like mega/party quota groups in the engine (soft quota-floor reserve)
-      - approvals are limited to candidates registered in that electorate
-      - inputs support abs_weight+population OR quota_floor
-      - no auto_include (for now)
-    """
-    groups: List[Group] = []
-    meta_rows: List[dict] = []
-
-    for i, e in enumerate(raw_electorates or []):
-        gid = str(e.get("id", f"E:{i}"))
-
-        quota_floor = e.get("quota_floor", None)
-        abs_weight = e.get("abs_weight", e.get("weight", None))
-        population = e.get("population", None)
-
-        share = None
-        rel_weight = None
-        derived_mode = None
-        saturation_assumed = False
-        pop_val = None
-        abs_val = None
-
-        if quota_floor is not None:
-            qf = float(quota_floor)
-            if qf <= 0:
-                continue
-            share, saturation_assumed = invert_share_from_quota_floor(qf)
-            rel_weight = share * total_voter_ballots
-            derived_mode = "quota_floor"
-            if population is not None:
-                pop_val = float(population)
-                abs_val = float(abs_weight) if abs_weight is not None else (share * pop_val)
-            else:
-                pop_val = None
-                abs_val = float(abs_weight) if abs_weight is not None else None
-            quota_floor = qf
-        else:
-            if abs_weight is None or population is None:
-                continue
-            abs_val = float(abs_weight)
-            pop_val = float(population)
-            if abs_val <= 0 or pop_val <= 0:
-                continue
-            share, rel_weight, qf = derive_quota_and_rel_weight_from_abs(abs_val, pop_val, total_voter_ballots)
-            quota_floor = qf
-            derived_mode = "abs_weight_population"
-            saturation_assumed = (abs(qf - (1.0 / 3.0)) <= 1e-12)
-
-        rel_weight = float(profile.scale_electorate_rel_weight(float(rel_weight)))
-
-        raw_cands = e.get("candidates", e.get("approvals", [])) or []
-        ordered = [str(x) for x in raw_cands]
-
-        # de-dupe preserve order (for meta only)
-        seen: Set[str] = set()
-        ordered_dedup: List[str] = []
-        for c in ordered:
-            if c not in seen:
-                seen.add(c)
-                ordered_dedup.append(c)
-
-        approvals = tuple(sorted(set(ordered_dedup) & candidate_set))
-
-        if len(approvals) == 0:
-            meta_rows.append({
-                "id": gid, "kind": "electorate",
-                "mode": derived_mode,
-                "population": pop_val if pop_val is not None else "",
-                "abs_weight": abs_val if abs_val is not None else "",
-                "share": share,
-                "rel_weight": rel_weight,
-                "quota_floor": quota_floor,
-                "electorate_candidate_list_len": len(ordered_dedup),
-                "approvals_simplified": 0,
-                "saturation_assumed_min_share": saturation_assumed,
-                "dropped_from_algorithm": True,
-            })
-            continue
-
-        groups.append(Group(
-            gid=gid, kind="electorate",
-            approvals=approvals,
-            weight=float(rel_weight),
-            quota_floor=float(quota_floor),
-            population=float(pop_val) if pop_val is not None else None,
-            abs_weight=float(abs_val) if abs_val is not None else None,
-            share=float(share) if share is not None else None,
-        ))
-
-        meta_rows.append({
-            "id": gid, "kind": "electorate",
-            "mode": derived_mode,
-            "population": pop_val if pop_val is not None else "",
-            "abs_weight": abs_val if abs_val is not None else "",
-            "share": share,
-            "rel_weight": rel_weight,
-            "quota_floor": quota_floor,
-            "electorate_candidate_list_len": len(ordered_dedup),
-            "approvals_simplified": len(approvals),
-            "saturation_assumed_min_share": saturation_assumed,
-            "dropped_from_algorithm": False,
-        })
-
-    return groups, meta_rows
-
-
-# ---------------------------
-# Prefix intervention
-# ---------------------------
 
 def parse_prefix_intervention(data: dict) -> Tuple[List[str], Set[str]]:
-    pi = data.get("prefix_intervention") or {}
-    allow = [str(x) for x in (pi.get("allow_only") or [])]
-    ban = set(str(x) for x in (pi.get("ban") or []))
-    return allow, ban
+    interventions = data.get("interventions", {}) or {}
+    allow = interventions.get("prefix_allow_only", []) or data.get("prefix_allow_only", [])
+    ban = interventions.get("ban", []) or data.get("ban", [])
+    allow_list = [str(x) for x in allow]
+    ban_set = set(str(x) for x in ban)
+    return allow_list, ban_set
+
+
+def quota_floor_from_share(share: float) -> float:
+    return min((2.0 / 3.0) * share, 1.0 / 3.0)
+
+
+def share_from_quota_floor(qf: float) -> float:
+    qf = float(qf)
+    if qf < (1.0 / 3.0) - 1e-15:
+        return 1.5 * qf
+    return 0.5
+
+
+def normalize_rel_weight_from_share(share: float, total_voter_ballots: float) -> float:
+    return float(share) * float(total_voter_ballots)
+
+
+META_FIELDS = [
+    "gid",
+    "kind",
+    "population",
+    "abs_weight",
+    "share",
+    "rel_weight",
+    "quota_floor",
+    "approvals_size",
+]
+
+
+def write_meta_csv(path: str, groups: List[Group]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=META_FIELDS)
+        w.writeheader()
+        for g in groups:
+            w.writerow({
+                "gid": g.gid,
+                "kind": g.kind,
+                "population": g.population or "",
+                "abs_weight": g.abs_weight or "",
+                "share": g.share or "",
+                "rel_weight": g.weight,
+                "quota_floor": g.quota_floor if g.quota_floor is not None else "",
+                "approvals_size": len(g.approvals),
+            })
+
+
+def parse_party_ballots(
+    party_defs: List[dict],
+    total_voter_ballots: float,
+    profile: ElectionProfile,
+) -> Tuple[List[Group], Dict[str, List[str]], List[Group], Set[str]]:
+    groups: List[Group] = []
+    party_lists: Dict[str, List[str]] = {}
+    meta: List[Group] = []
+    cands: Set[str] = set()
+
+    for i, d in enumerate(party_defs or []):
+        gid = str(d.get("id") or f"party_{i}")
+        candidates = [str(x) for x in (d.get("candidates") or d.get("list") or [])]
+        apps = _canon_approvals(candidates)
+        cands.update(apps)
+        party_lists[gid] = list(candidates)
+
+        population = d.get("population")
+        abs_weight = d.get("weight")
+        qf = d.get("quota_floor")
+
+        share = None
+        if population is not None and abs_weight is not None:
+            share = float(abs_weight) / float(population) if float(population) > 0 else 0.0
+            rel_w = normalize_rel_weight_from_share(share, total_voter_ballots)
+            if qf is None:
+                qf = quota_floor_from_share(share)
+        elif qf is not None:
+            share = share_from_quota_floor(float(qf))
+            rel_w = normalize_rel_weight_from_share(share, total_voter_ballots)
+        else:
+            rel_w = float(d.get("rel_weight", 0.0))
+
+        g = Group(
+            gid=gid,
+            kind="party",
+            approvals=apps,
+            weight=profile.scale_party_rel_weight(rel_w),
+            quota_floor=float(qf) if qf is not None else None,
+            population=float(population) if population is not None else None,
+            abs_weight=float(abs_weight) if abs_weight is not None else None,
+            share=float(share) if share is not None else None,
+            meta={"source": "party_ballots"},
+        )
+        groups.append(g)
+        meta.append(g)
+
+    return groups, party_lists, meta, cands
+
+
+def _expand_approvals_with_meta(
+    approvals: Set[str],
+    candidate_meta: Dict[str, dict],
+    where: Optional[Dict[str, Any]],
+) -> Set[str]:
+    if not where:
+        return approvals
+    approvals = set(approvals)
+    approvals |= candidates_matching_meta(candidate_meta, where)
+    return approvals
+
+
+def parse_mega_ballots(
+    mega_defs: List[dict],
+    total_voter_ballots: float,
+    candidate_set: Set[str],
+    candidate_meta: Dict[str, dict],
+    profile: ElectionProfile,
+) -> Tuple[List[Group], List[Group]]:
+    groups: List[Group] = []
+    meta: List[Group] = []
+
+    for i, d in enumerate(mega_defs or []):
+        gid = str(d.get("id") or f"mega_{i}")
+
+        raw_apps = set(str(x) for x in (d.get("candidates") or []))
+        where = d.get("include_where") or d.get("meta_where")
+        raw_apps = _expand_approvals_with_meta(raw_apps, candidate_meta, where)
+        apps = tuple(sorted(raw_apps & set(candidate_set)))
+
+        population = d.get("population")
+        abs_weight = d.get("weight")
+        qf = d.get("quota_floor")
+
+        share = None
+        if population is not None and abs_weight is not None:
+            share = float(abs_weight) / float(population) if float(population) > 0 else 0.0
+            rel_w = normalize_rel_weight_from_share(share, total_voter_ballots)
+            if qf is None:
+                qf = quota_floor_from_share(share)
+        elif qf is not None:
+            share = share_from_quota_floor(float(qf))
+            rel_w = normalize_rel_weight_from_share(share, total_voter_ballots)
+        else:
+            rel_w = float(d.get("rel_weight", 0.0))
+
+        g = Group(
+            gid=gid,
+            kind="mega",
+            approvals=apps,
+            weight=profile.scale_mega_rel_weight(rel_w),
+            quota_floor=float(qf) if qf is not None else None,
+            population=float(population) if population is not None else None,
+            abs_weight=float(abs_weight) if abs_weight is not None else None,
+            share=float(share) if share is not None else None,
+            meta={"source": "mega_ballots", "where": where},
+        )
+        groups.append(g)
+        meta.append(g)
+
+    return groups, meta
+
+
+def parse_electorate_ballots(
+    elect_defs: List[dict],
+    total_voter_ballots: float,
+    candidate_set: Set[str],
+    profile: ElectionProfile,
+) -> Tuple[List[Group], List[Group]]:
+    groups: List[Group] = []
+    meta: List[Group] = []
+
+    for i, d in enumerate(elect_defs or []):
+        gid = str(d.get("id") or f"electorate_{i}")
+        raw_apps = set(str(x) for x in (d.get("candidates") or []))
+        apps = tuple(sorted(raw_apps & set(candidate_set)))
+
+        population = d.get("population")
+        abs_weight = d.get("weight")
+        qf = d.get("quota_floor")
+
+        share = None
+        if population is not None and abs_weight is not None:
+            share = float(abs_weight) / float(population) if float(population) > 0 else 0.0
+            rel_w = normalize_rel_weight_from_share(share, total_voter_ballots)
+            if qf is None:
+                qf = quota_floor_from_share(share)
+        elif qf is not None:
+            share = share_from_quota_floor(float(qf))
+            rel_w = normalize_rel_weight_from_share(share, total_voter_ballots)
+        else:
+            rel_w = float(d.get("rel_weight", 0.0))
+
+        g = Group(
+            gid=gid,
+            kind="electorate",
+            approvals=apps,
+            weight=profile.scale_electorate_rel_weight(rel_w),
+            quota_floor=float(qf) if qf is not None else None,
+            population=float(population) if population is not None else None,
+            abs_weight=float(abs_weight) if abs_weight is not None else None,
+            share=float(share) if share is not None else None,
+            meta={"source": "electorate_ballots"},
+        )
+        groups.append(g)
+        meta.append(g)
+
+    return groups, meta
+
+
+def extract_candidates_from_defs(defs: List[dict]) -> Set[str]:
+    s: Set[str] = set()
+    for d in defs or []:
+        s.update(str(x) for x in (d.get("candidates") or d.get("list") or []))
+    return s
+
+
+def projection_seat_equiv(total_projection: float, seats: int) -> int:
+    return int(math.ceil(float(total_projection) * float(seats) - 1e-15))
