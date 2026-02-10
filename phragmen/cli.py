@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Set, Tuple
-
 import argparse
 import csv
 import json
@@ -11,38 +10,15 @@ from . import io as io_mod
 from .engine import (
     ROUND_FIELDS, QUOTA_FIELDS, PROJ_FIELDS,
     build_supporters, choose_candidate_for_round,
-    compute_projection_delta_for_chosen, compute_quota_active_info,
-    spend_winner_reset,
-    spend_winner_fifo_time_priority_tiers,
+    compute_projection_delta_for_chosen,
+    compute_quota_active_info,
     fifo_balance_at,
+    parse_spend_tiers,
+    spend_winner_fifo_time_priority_tiers,
+    spend_winner_reset,
 )
 from .profiles import get_profile, list_profiles
 from .types import ElectionProfile, Group
-
-
-VALID_KINDS = {"base", "electorate", "party", "mega"}
-
-
-def parse_spend_tiers(spec: str) -> List[List[str]]:
-    """
-    Spec syntax:
-      tiers separated by '>'
-      kinds within a tier separated by ','
-    Example:
-      "base>party>electorate,mega"
-    """
-    tiers: List[List[str]] = []
-    for tier_str in spec.split(">"):
-        kinds = [k.strip() for k in tier_str.split(",") if k.strip()]
-        if not kinds:
-            continue
-        for k in kinds:
-            if k not in VALID_KINDS:
-                raise ValueError(f"Invalid kind '{k}' in spend_tiers. Valid: {sorted(VALID_KINDS)}")
-        tiers.append(kinds)
-    if not tiers:
-        raise ValueError("spend_tiers produced zero tiers.")
-    return tiers
 
 
 def open_csv(path: str, fieldnames: List[str]):
@@ -108,11 +84,8 @@ def select_pool_by_coverage(
     winners: List[str],
     intervals: List[Tuple[float, float]],
     a: float,
-    b: float
+    b: float,
 ) -> List[str]:
-    """
-    Select winners whose projection-interval [p0,p1] intersects [a,b] in your "coverage" sense.
-    """
     out: List[str] = []
     for w, (p0, p1) in zip(winners, intervals):
         if p0 < b - 1e-15 and p1 >= a - 1e-15:
@@ -123,11 +96,8 @@ def select_pool_by_coverage(
 def prefix_until_projection_strict_gt(
     winners: List[str],
     intervals: List[Tuple[float, float]],
-    target: float
+    target: float,
 ) -> List[str]:
-    """
-    Return prefix winners up to and including the first seat where total_projection > target (strict).
-    """
     out: List[str] = []
     for w, (_p0, p1) in zip(winners, intervals):
         out.append(w)
@@ -157,20 +127,16 @@ def run_sequential(
     spend_tiers_spec: str,
     tier_within_mode: str,
 ) -> dict:
-    """
-    One sequential run (one pass / A / B run).
-    """
     spend_tiers = parse_spend_tiers(spend_tiers_spec)
 
     groups = base_groups + mega_groups + party_groups + electorate_groups
     weights = [g.weight for g in groups]
-
     supporters = build_supporters(groups, candidates)
+
     gid_to_index = {g.gid: i for i, g in enumerate(groups)}
     quota_groups = [g for g in groups if g.kind in ("mega", "party", "electorate")]
 
     total_voter_ballots = io_mod.total_normal_ballots_weight(base_groups)
-    proj_total_for_quota = io_mod.projection_total_for_quota_from_base(base_groups)
 
     p_total = 0.0
     used_voter_ballots_cum = 0.0
@@ -193,11 +159,11 @@ def run_sequential(
     winners: List[str] = []
     winners_set: Set[str] = set()
 
-    # FIFO representation:
+    # FIFO representation
     t_now = 0.0
     t_start = [0.0 for _ in groups]
 
-    # Legacy balances for non-FIFO (only used if spend_mode != fifo_time_priority):
+    # Legacy balances (debug-only)
     balances = [0.0 for _ in groups]
 
     def legacy_apply_time_step(dt: float) -> None:
@@ -207,7 +173,7 @@ def run_sequential(
             balances[i] += dt * weights[i]
 
     try:
-        for r in range(1, seats + 1):
+        for r in range(1, min(seats, len(candidates)) + 1):
             if stop_when_proj_gt is not None and p_total > stop_when_proj_gt + 1e-15:
                 break
 
@@ -215,12 +181,12 @@ def run_sequential(
             if not remaining:
                 break
 
-            r_eff = max(r, proj_total_for_quota)
-            projection_delta_for_quota = r_eff - r
+            proj_seat_equiv = io_mod.projection_seat_equiv(p_total, seats)
+            r_eff = max(r, proj_seat_equiv)
 
             quota_info = compute_quota_active_info(quota_groups, winners, r_eff)
 
-            # quota groups only "race" when active; base always races
+            # Active mask: base always active; quota groups only when unsatisfied
             active_mask = [True] * len(groups)
             for g in quota_groups:
                 active_mask[gid_to_index[g.gid]] = bool(quota_info[g.gid][0])
@@ -256,9 +222,9 @@ def run_sequential(
                 t_now += dt
             else:
                 legacy_apply_time_step(dt)
-                t_now += dt  # keep for logging
+                t_now += dt
 
-            # franchise participation / projection accounting (base groups only)
+            # franchise accounting (base only, one-time)
             newly_used_ballots = compute_projection_delta_for_chosen(
                 chosen, groups, supporters, active_mask, base_used
             )
@@ -281,7 +247,6 @@ def run_sequential(
                     tier_within_mode=tier_within_mode,
                 )
             else:
-                # legacy reset (kept only for debugging / comparison)
                 spend_winner_reset(
                     cand=chosen,
                     balances=balances,
@@ -304,7 +269,6 @@ def run_sequential(
 
             active_quota_groups = sum(1 for g in quota_groups if quota_info[g.gid][0])
 
-            # write rows
             if rounds_w:
                 rounds_w.writerow({
                     "label": label,
@@ -321,12 +285,11 @@ def run_sequential(
                     "used_voter_ballots_cum": f"{used_voter_ballots_cum:.6f}",
                     "projection_interval_prev": f"{p_prev:.12f}",
                     "projection_interval_curr": f"{p_total:.12f}",
-                    "r_eff": r_eff,
-                    "projection_total_for_quota": proj_total_for_quota,
-                    "projection_delta_for_quota": projection_delta_for_quota,
-                    "active_quota_groups": active_quota_groups,
-                    "prefix_allow_pool_size_before": prefix_size_before,
-                    "iter_allow_pool_size_before": iter_size_before,
+                    "r_eff": int(r_eff),
+                    "proj_seat_equiv": int(proj_seat_equiv),
+                    "active_quota_groups": int(active_quota_groups),
+                    "prefix_allow_pool_size_before": int(prefix_size_before),
+                    "iter_allow_pool_size_before": int(iter_size_before),
                     "allow_pool_source": pool_source,
                     "allow_only_used": 1 if allow_used else 0,
                     "spend_mode": spend_mode,
@@ -352,11 +315,7 @@ def run_sequential(
                 for g in quota_groups:
                     active, in_set, req = quota_info[g.gid]
                     gi = gid_to_index[g.gid]
-                    bal_after = (
-                        fifo_balance_at(t_now, t_start, weights, gi)
-                        if spend_mode == "fifo_time_priority"
-                        else balances[gi]
-                    )
+                    bal_after = fifo_balance_at(t_now, t_start, weights, gi) if spend_mode == "fifo_time_priority" else balances[gi]
                     quota_w.writerow({
                         "label": label,
                         "round": r,
@@ -390,8 +349,6 @@ def run_sequential(
         "final_time": t_now,
         "final_projection": p_total,
         "stopped_at_round": len(winners),
-        "total_voter_ballots": total_voter_ballots,
-        "projection_total_for_quota": proj_total_for_quota,
     }
 
 
@@ -412,13 +369,6 @@ def run_full_chamber_completion(
     spend_tiers_spec: str,
     tier_within_mode: str,
 ) -> dict:
-    """
-    Full chamber is the larger of:
-      - input seats
-      - the first round where projection > 2/3 (strict)
-    This function generates the long run, then finds the minimal R satisfying that.
-    """
-    cap = max(seats, len(candidates_list))  # safe cap so we don't request more seats than candidates
     label = "converged_full"
     rounds_csv = os.path.join(outdir, f"{label}_rounds.csv")
     quota_csv = os.path.join(outdir, f"{label}_quota.csv")
@@ -427,7 +377,7 @@ def run_full_chamber_completion(
     _ = run_sequential(
         label=label,
         candidates=candidates_list,
-        seats=cap,
+        seats=len(candidates_list),
         base_groups=base_groups,
         mega_groups=mega_groups,
         party_groups=party_groups,
@@ -453,46 +403,39 @@ def run_full_chamber_completion(
         if i >= seats and p1 > completion_target + 1e-15:
             R2 = i
             break
+
     if R2 is None:
         R2 = len(winners)
+    full_size = min(len(candidates_list), max(seats, R2))
 
     return {
         "label": label,
-        "cap_run": cap,
-        "full_chamber_rounds": R2,
-        "full_chamber_winners": winners[:R2],
-        "full_chamber_projection": intervals[R2 - 1][1] if R2 >= 1 else 0.0,
+        "full_chamber_rounds": full_size,
+        "full_chamber_winners": winners[:full_size],
+        "full_chamber_projection": intervals[full_size - 1][1] if full_size >= 1 and full_size <= len(intervals) else (intervals[-1][1] if intervals else 0.0),
         "rounds_csv": rounds_csv,
         "quota_csv": quota_csv,
         "projection_csv": proj_csv,
-        "infeasible_full_chamber": (len(winners) < seats),
+        "note": "full chamber size = max(input seats, first round with projection > 2/3 strict), capped by candidate count",
     }
 
 
 def main(argv: Optional[List[str]] = None) -> None:
-    ap = argparse.ArgumentParser(description="Sequential Phragmén (profiles + FIFO cutoff-τ spending + interventions).")
+    ap = argparse.ArgumentParser(description="Sequential Phragmén FIFO + quota reserve racers + multi-pass convergence.")
     ap.add_argument("input_json", help="Election JSON file.")
-    ap.add_argument("--outdir", default="out", help="Output directory for CSVs.")
+    ap.add_argument("--outdir", default="out", help="Directory for CSV outputs.")
     ap.add_argument("--quota_meta_csv", default=None, help="Write normalized quota-group meta CSV (path).")
     ap.add_argument("--max_iters", type=int, default=19, help="Max iterations INCLUDING the first pass.")
-    ap.add_argument("--no_prompt", action="store_true",
-                    help="Disable interactive prompts (profile selection + more-iters).")
-    ap.add_argument("--profile", default=None,
-                    help="Profile key (e.g. general_alpha). If omitted, prompt (unless --no_prompt).")
+    ap.add_argument("--no_prompt", action="store_true", help="Disable interactive prompts.")
+    ap.add_argument("--profile", default=None, help="Profile key (default prompts, else general_alpha).")
 
-    ap.add_argument("--spend_mode", choices=["reset", "fifo_time_priority"], default=None,
-                    help="Spending mode. Overrides profile.")
-    ap.add_argument("--dt0_tie_rule", choices=["party_then_name", "max_have_then_party_then_name"], default=None,
-                    help="How to break dt=0 ties. Overrides profile.")
-
-    ap.add_argument("--spend_tiers", default=None,
-                    help='Tier plan, e.g. "base>party>electorate,mega". Overrides profile/JSON.')
-    ap.add_argument("--tier_within_mode", choices=["combined_fifo", "separate_by_kind"], default=None,
-                    help="Within-tier behaviour when multiple kinds share a tier. Overrides profile/JSON.")
+    ap.add_argument("--spend_mode", choices=["reset", "fifo_time_priority"], default=None, help="Override spend mode.")
+    ap.add_argument("--dt0_tie_rule", choices=["party_then_name", "max_have_then_party_then_name"], default=None, help="Override dt=0 tie rule.")
+    ap.add_argument("--spend_tiers", default=None, help='Override tier plan, e.g. "base>party>electorate,mega".')
+    ap.add_argument("--tier_within_mode", choices=["combined_fifo", "separate_by_kind"], default=None, help="Override within-tier mode.")
 
     args = ap.parse_args(argv)
 
-    # profile
     if args.profile is None:
         profile = get_profile("general_alpha") if args.no_prompt else choose_profile_interactive()
     else:
@@ -501,50 +444,35 @@ def main(argv: Optional[List[str]] = None) -> None:
     with open(args.input_json, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # resolve settings (CLI > JSON > profile)
     spend_mode = args.spend_mode or data.get("spend_mode") or profile.spend_mode
     dt0_tie_rule = args.dt0_tie_rule or data.get("dt0_tie_rule") or profile.dt0_tie_rule
+    spend_tiers_spec = args.spend_tiers or data.get("spend_tiers") or profile.spend_tiers_default
+    tier_within_mode = args.tier_within_mode or data.get("tier_within_mode") or profile.tier_within_mode
 
-    spend_tiers_spec = (
-        args.spend_tiers
-        or data.get("spend_tiers")
-        or getattr(profile, "spend_tiers_default", "base>electorate>party>mega")
-    )
-    tier_within_mode = (
-        args.tier_within_mode
-        or data.get("tier_within_mode")
-        or getattr(profile, "tier_within_mode", "combined_fifo")
-    )
-
-    # validate tiers early
     _ = parse_spend_tiers(spend_tiers_spec)
 
     seats = int(data["seats"])
 
-    # build base groups + candidate universe
     base_groups = io_mod.canonicalize_base_ballots(data.get("ballots", []), profile=profile)
     total_voter_ballots = io_mod.total_normal_ballots_weight(base_groups)
 
     candidate_meta = io_mod.parse_candidate_meta(data.get("candidate_meta") or {})
 
     candidates: Set[str] = set(str(c) for c in data.get("candidates", []))
-    candidates.update(io_mod.candidates_from_groups(base_groups))
+    candidates |= io_mod.candidates_from_groups(base_groups)
+    candidates |= io_mod.extract_candidates_from_defs(data.get("party_ballots", []))
+    candidates |= io_mod.extract_candidates_from_defs(data.get("electorate_ballots", []))
+    candidates |= io_mod.extract_candidates_from_defs(data.get("mega_ballots", []))
 
-    # interventions
     prefix_allow, ban = io_mod.parse_prefix_intervention(data)
 
-    # party groups
     party_groups, party_lists, party_meta, party_cands = io_mod.parse_party_ballots(
         data.get("party_ballots", []),
         total_voter_ballots=total_voter_ballots,
         profile=profile,
     )
-    candidates.update(party_cands)
+    candidates |= party_cands
 
-    # electorate defs can also introduce candidates
-    candidates.update(io_mod.extract_candidates_from_defs(data.get("electorate_ballots", [])))
-
-    # mega + electorate groups
     mega_groups, mega_meta = io_mod.parse_mega_ballots(
         data.get("mega_ballots", []),
         total_voter_ballots=total_voter_ballots,
@@ -561,16 +489,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     candidates_list = sorted(candidates)
+    os.makedirs(args.outdir, exist_ok=True)
 
-    # optional meta CSV
     if args.quota_meta_csv:
         io_mod.write_meta_csv(args.quota_meta_csv, mega_meta + party_meta + electorate_meta)
 
-    os.makedirs(args.outdir, exist_ok=True)
-
-    # ------------------------
     # PASS 1
-    # ------------------------
     pass1_label = "pass01"
     pass1_rounds = os.path.join(args.outdir, f"{pass1_label}_rounds.csv")
     pass1_quota = os.path.join(args.outdir, f"{pass1_label}_quota.csv")
@@ -599,20 +523,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     pass1_winners, pass1_intervals = recompute_intervals_from_rounds_csv(pass1_rounds)
-    pass1_prefix = prefix_until_projection_strict_gt(pass1_winners, pass1_intervals, profile.sig_target)
+    pass1_sig = tuple(prefix_until_projection_strict_gt(pass1_winners, pass1_intervals, profile.sig_target))
 
-    # signature map for cycle/twin detection (any repeat signature is a hit)
-    seen: Dict[Tuple[str, ...], int] = {tuple(pass1_prefix): 1}
-    seen_label: Dict[Tuple[str, ...], str] = {tuple(pass1_prefix): "pass01"}
-
+    seen: Dict[Tuple[str, ...], int] = {pass1_sig: 1}
     prev_B_full_winners = pass1_winners
     prev_B_full_intervals = pass1_intervals
 
     solved = False
-    solved_iter: Optional[int] = None
-    twin_iter: Optional[int] = None
-    twin_label: Optional[str] = None
-    cycle_len: Optional[int] = None
+    solved_iter = None
+    twin_iter = None
+    cycle_len = None
 
     it = 2
     max_iters_current = args.max_iters
@@ -622,8 +542,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             labelA = f"iter{it:02d}A"
             labelB = f"iter{it:02d}B"
 
-            # A: allow-only coverage winners from [1/9, 5/9]
-            pool_A = select_pool_by_coverage(prev_B_full_winners, prev_B_full_intervals, 1 / 9, 5 / 9)
+            pool_A = select_pool_by_coverage(prev_B_full_winners, prev_B_full_intervals, 1/9, 5/9)
 
             A_rounds = os.path.join(args.outdir, f"{labelA}_rounds.csv")
             A_quota = os.path.join(args.outdir, f"{labelA}_quota.csv")
@@ -653,7 +572,6 @@ def main(argv: Optional[List[str]] = None) -> None:
 
             A_winners, _A_intervals = recompute_intervals_from_rounds_csv(A_rounds)
 
-            # B: allow-only the entire A list in order until consumed
             pool_B = list(A_winners)
 
             B_rounds = os.path.join(args.outdir, f"{labelB}_rounds.csv")
@@ -683,22 +601,18 @@ def main(argv: Optional[List[str]] = None) -> None:
             )
 
             B_winners, B_intervals = recompute_intervals_from_rounds_csv(B_rounds)
-
-            # Signature is the prefix until projection > 5/9 (strict)
-            B_prefix = prefix_until_projection_strict_gt(B_winners, B_intervals, profile.sig_target)
-            sig = tuple(B_prefix)
+            sig = tuple(prefix_until_projection_strict_gt(B_winners, B_intervals, profile.sig_target))
 
             if sig in seen:
                 solved = True
                 solved_iter = it
                 twin_iter = seen[sig]
-                twin_label = seen_label.get(sig, "pass01" if twin_iter == 1 else f"iter{twin_iter:02d}B")
                 cycle_len = it - twin_iter
+                prev_B_full_winners = B_winners
+                prev_B_full_intervals = B_intervals
                 break
 
             seen[sig] = it
-            seen_label[sig] = labelB
-
             prev_B_full_winners = B_winners
             prev_B_full_intervals = B_intervals
             it += 1
@@ -743,12 +657,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         "status": "repeat_signature_found" if solved else "not_converged",
         "repeat_at_iteration": solved_iter,
         "twin_iteration": twin_iter,
-        "twin_label": twin_label,
         "cycle_length": cycle_len,
-        "max_iters_initial": args.max_iters,
-        "max_iters_reached": max_iters_current,
+        "signature_definition": "Part-B prefix winners until projection > 5/9 (strict)",
         "completion": completion,
-        "signature_definition": f"Part-B prefix winners until projection > {profile.sig_target} (strict)",
+        "iters_seen": len(seen),
     }, ensure_ascii=False, indent=2))
 
 
