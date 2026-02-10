@@ -81,10 +81,6 @@ Party ballots are a special case of mega ballots:
 - Their candidate list is **not a ranking**
 - List order is used only to break ties between equal-time candidates
 
-### 2.4 Electorate ballots
-
-See description of electorate ballots at end of readme.
-
 ---
 
 ## 3. Projection: measuring franchise participation
@@ -370,7 +366,7 @@ Add an optional top-level array:
   "electorate_ballots": [
     {
       "id": "E:Wellington",
-      "population": 3500250,
+      "population": 59899,
       "abs_weight": 59899,
       "candidates": ["cand_1", "cand_2", "cand_3"]
     }
@@ -423,55 +419,155 @@ Each row reports (where applicable):
 
 ---
 
-## FIFO spend mode (time-priority) and cutoff τ
+# Sequential Phragmén on Crack — FIFO Time-Priority Edition
 
-This repo supports a **FIFO spend mode** for sequential Phragmén-style credit accounting:
+This repository implements a generalized, auditable sequential Phragmén engine with:
 
-- Each approval group `g` has a constant earning rate `w_g` (its weight).
-- Instead of “resetting balances”, FIFO mode treats each group’s unspent credit as **credit accrued over time since its last spend**.
-- A group stores only a single timestamp `t_start[g]` meaning: *the start time of its currently-unspent credit interval*.
+- **FIFO (time-priority) credit spending** using a cutoff time **τ**
+- **soft quota floors** for `electorate`, `party`, and `mega` groups
+- quota groups that are **either active (unsatisfied)** or **dormant (satisfied)**  
+  - dormant groups **accumulate reserve** but **do not contribute** to candidate selection
+- intervention-compatible sequencing (prefix allow-only, iterative allow-only, bans)
+- **multi-pass A/B iteration** with **cycle/twin signature detection**
+- **franchise (projection) accounting** for electorate inclusion / participation analysis
+- auditable CSV outputs for every round
 
-At global algorithm time `t_now`, the group’s spendable credit is:
+---
 
-\[
-B_g(t_{now}) = w_g \cdot \max(0, t_{now} - t_{start,g})
-\]
+## 1) Credit model (FIFO)
 
-### Spending 1 seat value by FIFO
+Each group *g* earns credit continuously at rate `w_g`.
 
-When a candidate wins, we spend **exactly 1.0** of credit (unless infeasible) using **oldest credit first**.
+FIFO mode stores, per group:
 
-For a given set of paying groups `S`, FIFO spending is defined by finding a **cutoff time** \( \tau \le t_{now} \) such that:
+- `t_start[g]`: start time of *currently unspent* credit interval
+- `t_now`: global time
 
-\[
-\sum_{g \in S} w_g \cdot \max(0, \tau - t_{start,g}) = 1
-\]
+Unspent credit at time `t_now`:
+`B_g(t_now) = w_g × max(0, t_now − t_start[g])`
 
-This sum is a piecewise-linear function of \( \tau \). We solve it efficiently by sorting the `t_start` values and sweeping segments until the equation reaches 1.
+This automatically supports reserve accumulation for dormant groups (their `t_start` does not advance while dormant).
 
-Once \( \tau \) is found:
+---
 
-- Each paying group with `t_start[g] < τ` advances its `t_start[g]` up to `τ` (consuming its oldest credit first).
-- Any credit accrued **after τ** remains intact automatically (FIFO leftovers).
-- If a tier cannot cover the remaining amount, its groups are fully drained by setting `t_start[g] = t_now`.
+## 2) FIFO spend mode and cutoff τ
 
-This “cutoff τ” logic reproduces the behaviour seen in the Approval Scorecard examples:
-earlier-accrued credit can fund a later winner **without touching** newer credit that began accruing after some groups were reset/spent in intervening rounds.
+When a candidate is elected, spend exactly **1.0 seat value** using **oldest credit first**.
 
-### Tiered priority spending
+Given paying groups `S`, find a cutoff time `τ ≤ t_now` such that:
+`Σ_g∈S w_g × max(0, τ − t_start[g]) = 1`
 
-FIFO spending supports **priority tiers** across group kinds (and optional grouping of kinds in the same tier):
+Then advance each paying group’s `t_start[g]` up to `τ` (or to `t_now` if fully drained).
 
-- Default: `base>electorate>party>mega`
-- Example: `base>party>electorate,mega` (electorate + mega treated as one tier)
+This preserves “overshoot leftovers” automatically: credit earned after `τ` remains intact.
 
-Within a tier containing multiple kinds, the default is **combined FIFO**:
-all groups in that tier are pooled and a single cutoff \( \tau \) is computed for the tier.
+---
 
-You can override tiers on the CLI:
+## 3) Soft quota floors: active vs dormant
+
+Quota groups (`electorate`, `party`, `mega`) are **minimum quota floors**.
+
+They behave as **reserve racers**:
+
+- **Dormant (satisfied)**: they keep accumulating reserve, but do not affect dt/have (not in the race).
+- **Active (unsatisfied)**: they contribute to dt/have and can be spent FIFO.
+
+Quota test at effective chamber size `r_eff`:
+
+`required = ceil(quota_floor × r_eff)`
+
+`active iff winners_in_set < required`
+
+
+`r_eff` uses both seat count and projection seat-equivalent:
+
+`proj_seat_equiv = ceil(total_projection × seats)`
+
+`r_eff = max(current_round, proj_seat_equiv)`
+
+
+---
+
+## 4) Tiered priority spending
+
+Spend is performed by priority tiers across kinds.
+
+Default: `base > electorate > party > mega`
+
+You can group kinds in a tier: `base > party > electorate,mega`
+
+
+Within a tier:
+
+- `combined_fifo` (default): pool kinds, compute one τ
+- `separate_by_kind`: FIFO spend kind-by-kind in listed order
+
+---
+
+## 5) Franchise participation (projection)
+
+Projection measures electorate inclusion:
+
+- Only `base` (voter) groups contribute.
+- Each base group is counted at most once (no double-counting).
+- Per winner:
+  - `delta_voter_ballots_used`
+  - `delta_projection = delta / total_voter_ballots`
+  - `total_projection` cumulative
+
+Projection is written to CSV and drives convergence signatures and the “full chamber” rule.
+
+---
+
+## 6) Multi-pass A/B iteration + cycle detection
+
+Pass 1: normal sequential run.
+
+For pass ≥ 2:
+
+- **A**: allow-only winners covering projection interval **[1/9, 5/9]** from previous pass
+- **B**: allow-only the entire A list (in order), then run until projection **> 5/9 (strict)**
+
+Signature = “Part-B prefix of winners until projection > 5/9 (strict)”.
+
+All signatures are stored; any repeat signature is a **twin / cycle**.
+Cycle length is detected as the difference in iteration indices.
+
+The CLI prompts for more iterations in blocks (default 19) unless `--no_prompt` is set.
+
+---
+
+## 7) Full chamber completion rule
+
+Full chamber size is:
+`max(
+input seats,
+first round where projection > 2/3 (strict)
+)`
+
+
+Capped by the number of candidates.
+
+---
+
+## 8) Outputs
+
+Each pass writes:
+
+- `*_rounds.csv` — dt/have/time + projection + quota activation + intervention usage
+- `*_quota.csv` — quota group active flags + reserve balances
+- `*_projection.csv` — projection accounting per round
+- optional `--quota_meta_csv` — normalized population/weight/share/quota_floor
+
+---
+
+## 9) Run
 
 ```bash
-python -m phragmen.cli election.json \
-  --spend_mode fifo_time_priority \
+python -m phragmen.cli election.json --outdir out \
+  --profile general_alpha \
   --spend_tiers "base>party>electorate,mega" \
   --tier_within_mode combined_fifo
+```
+
+---
