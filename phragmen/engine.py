@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Set, Tuple
-
 import math
 
 from .types import EPS, Group
@@ -23,8 +22,7 @@ ROUND_FIELDS = [
     "projection_interval_prev",
     "projection_interval_curr",
     "r_eff",
-    "projection_total_for_quota",
-    "projection_delta_for_quota",
+    "proj_seat_equiv",
     "active_quota_groups",
     "prefix_allow_pool_size_before",
     "iter_allow_pool_size_before",
@@ -75,6 +73,27 @@ def build_supporters(groups: List[Group], candidates: List[str]) -> Dict[str, Li
     return idx
 
 
+def party_rank_maps(party_lists: Dict[str, List[str]]) -> Dict[str, Dict[str, int]]:
+    return {pid: {c: i for i, c in enumerate(lst)} for pid, lst in party_lists.items()}
+
+
+def tie_break_by_party_order(tied_candidates: List[str], party_lists: Dict[str, List[str]]) -> str:
+    rank_maps = party_rank_maps(party_lists)
+    best = None  # (rank_index, candidate)
+    for c in tied_candidates:
+        best_rank = None
+        for rm in rank_maps.values():
+            if c in rm:
+                r = rm[c]
+                if best_rank is None or r < best_rank:
+                    best_rank = r
+        if best_rank is not None:
+            key = (best_rank, c)
+            if best is None or key < best:
+                best = key
+    return best[1] if best is not None else min(tied_candidates)
+
+
 def quota_required(quota_floor: float, r_eff: int) -> int:
     return int(math.ceil(quota_floor * r_eff - 1e-15))
 
@@ -82,21 +101,144 @@ def quota_required(quota_floor: float, r_eff: int) -> int:
 def compute_quota_active_info(
     quota_groups: List[Group],
     winners_so_far: List[str],
-    r_eff: int
+    r_eff: int,
 ) -> Dict[str, Tuple[bool, int, int]]:
     info: Dict[str, Tuple[bool, int, int]] = {}
+    winners_set = set(winners_so_far)
     for g in quota_groups:
         qf = float(g.quota_floor or 0.0)
         req = quota_required(qf, r_eff)
+        if req <= 0:
+            info[g.gid] = (False, 0, 0)
+            continue
         s = set(g.approvals)
-        in_set = sum(1 for w in winners_so_far if w in s)
-        info[g.gid] = (in_set < req, in_set, req)
+        in_set = sum(1 for w in winners_set if w in s)
+        active = in_set < req
+        info[g.gid] = (active, in_set, req)
     return info
 
 
-# -----------------------
-# dt / have computations
-# -----------------------
+def fifo_balance_at(t_now: float, t_start: List[float], weights: List[float], i: int) -> float:
+    w = weights[i]
+    if w <= EPS:
+        return 0.0
+    dt = t_now - t_start[i]
+    return w * dt if dt > 0 else 0.0
+
+
+def _available_credit_fifo(t_now: float, t_start: List[float], weights: List[float], indices: List[int]) -> float:
+    return sum(fifo_balance_at(t_now, t_start, weights, i) for i in indices)
+
+
+def _fifo_cutoff_tau(
+    t_now: float,
+    t_start: List[float],
+    weights: List[float],
+    indices: List[int],
+    amount: float,
+) -> float:
+    if amount <= 0:
+        return min((t_start[i] for i in indices), default=t_now)
+
+    items: List[Tuple[float, float]] = []
+    for i in indices:
+        w = weights[i]
+        if w > EPS:
+            items.append((t_start[i], w))
+    if not items:
+        return t_now
+
+    items.sort(key=lambda x: x[0])
+    starts = [s for (s, _w) in items]
+    ws = [w for (_s, w) in items]
+
+    spent = 0.0
+    W = 0.0
+
+    cur = starts[0]
+    j = 0
+    while j < len(starts) and abs(starts[j] - cur) <= 1e-18:
+        W += ws[j]
+        j += 1
+
+    while True:
+        nxt = t_now
+        if j < len(starts):
+            nxt = min(nxt, starts[j])
+        if nxt < cur:
+            nxt = cur
+
+        cap = W * (nxt - cur)
+        if spent + cap >= amount - 1e-15:
+            if W <= EPS:
+                return cur
+            return min(cur + (amount - spent) / W, t_now)
+
+        spent += cap
+        cur = nxt
+        if abs(cur - t_now) <= 1e-18:
+            return t_now
+
+        while j < len(starts) and abs(starts[j] - cur) <= 1e-18:
+            W += ws[j]
+            j += 1
+
+
+def _fifo_spend_exact_amount(
+    t_now: float,
+    t_start: List[float],
+    weights: List[float],
+    indices: List[int],
+    amount: float,
+) -> float:
+    if amount <= 0 or not indices:
+        return 0.0
+    avail = _available_credit_fifo(t_now, t_start, weights, indices)
+    if avail <= EPS:
+        return 0.0
+    if amount >= avail - 1e-15:
+        for i in indices:
+            t_start[i] = t_now
+        return avail
+
+    tau = _fifo_cutoff_tau(t_now, t_start, weights, indices, amount)
+    spent = 0.0
+    for i in indices:
+        w = weights[i]
+        if w <= EPS:
+            continue
+        s = t_start[i]
+        if tau > s:
+            spent_i = w * (tau - s)
+            spent += spent_i
+            t_start[i] = tau
+    return min(spent, amount)
+
+
+def candidate_dt_fifo(
+    cand: str,
+    t_now: float,
+    t_start: List[float],
+    weights: List[float],
+    supporters: Dict[str, List[int]],
+    active_mask: List[bool],
+) -> Optional[Tuple[float, float, float]]:
+    have = 0.0
+    rate = 0.0
+    for gi in supporters.get(cand, []):
+        if not active_mask[gi]:
+            continue
+        w = weights[gi]
+        if w <= EPS:
+            continue
+        have += w * max(0.0, t_now - t_start[gi])
+        rate += w
+    if rate <= EPS:
+        return None
+    if have >= 1.0 - EPS:
+        return (0.0, have, rate)
+    return ((1.0 - have) / rate, have, rate)
+
 
 def candidate_dt_balances(
     cand: str,
@@ -119,62 +261,9 @@ def candidate_dt_balances(
     return ((1.0 - have) / rate, have, rate)
 
 
-def candidate_dt_fifo(
-    cand: str,
-    t_now: float,
-    t_start: List[float],
-    weights: List[float],
-    supporters: Dict[str, List[int]],
-    active_mask: List[bool],
-) -> Optional[Tuple[float, float, float]]:
-    have = 0.0
-    rate = 0.0
-    for gi in supporters.get(cand, []):
-        if not active_mask[gi]:
-            continue
-        w = weights[gi]
-        if w <= EPS:
-            continue
-        b = w * max(0.0, t_now - t_start[gi])
-        have += b
-        rate += w
-    if rate <= EPS:
-        return None
-    if have >= 1.0 - EPS:
-        return (0.0, have, rate)
-    return ((1.0 - have) / rate, have, rate)
-
-
-# -----------------------
-# Party tie-break support
-# -----------------------
-
-def party_rank_maps(party_lists: Dict[str, List[str]]) -> Dict[str, Dict[str, int]]:
-    return {pid: {c: i for i, c in enumerate(lst)} for pid, lst in party_lists.items()}
-
-
-def tie_break_by_party_order(tied_candidates: List[str], party_lists: Dict[str, List[str]]) -> str:
-    rank_maps = party_rank_maps(party_lists)
-    best = None  # (rank_index, candidate)
-    for c in tied_candidates:
-        best_rank = None
-        for rm in rank_maps.values():
-            if c in rm:
-                r = rm[c]
-                if best_rank is None or r < best_rank:
-                    best_rank = r
-        if best_rank is not None:
-            key = (best_rank, c)
-            if best is None or key < best:
-                best = key
-    return best[1] if best is not None else min(tied_candidates)
-
-
 def choose_candidate_for_round(
     remaining: List[str],
-    # balances mode
     balances: Optional[List[float]],
-    # fifo mode
     t_now: Optional[float],
     t_start: Optional[List[float]],
     weights: List[float],
@@ -183,13 +272,8 @@ def choose_candidate_for_round(
     party_lists: Dict[str, List[str]],
     allow_only_pool: Optional[Set[str]] = None,
     dt0_tie_rule: str = "party_then_name",
-    spend_mode: str = "reset",
+    spend_mode: str = "fifo_time_priority",
 ) -> Tuple[str, float, float, float, bool]:
-    """
-    Select by minimum dt as usual.
-    Special: if best dt == 0 and dt0_tie_rule = max_have_then_party_then_name,
-    choose among dt==0 ties the candidate with greatest 'have' first.
-    """
     allow_used = False
     if allow_only_pool is not None and len(allow_only_pool) > 0:
         filtered = [c for c in remaining if c in allow_only_pool]
@@ -214,7 +298,7 @@ def choose_candidate_for_round(
         scored.append((dt, c, have, rate))
 
     if not scored:
-        raise ValueError("No candidates affordable (no active supporters?).")
+        raise ValueError("No candidates affordable (no active supporters).")
 
     scored.sort(key=lambda x: (x[0], x[1]))
     best_dt = scored[0][0]
@@ -223,8 +307,6 @@ def choose_candidate_for_round(
     if len(tied) == 1:
         dt, c, have, rate = tied[0]
         return c, dt, have, rate, allow_used
-
-    tied_candidates = [c for (_dt, c, _have, _rate) in tied]
 
     if abs(best_dt) <= 1e-12 and dt0_tie_rule == "max_have_then_party_then_name":
         max_have = max(h for (_dt, _c, h, _r) in tied)
@@ -238,6 +320,7 @@ def choose_candidate_for_round(
             if c == chosen:
                 return c, dt, have, rate, allow_used
 
+    tied_candidates = [c for (_dt, c, _have, _rate) in tied]
     chosen = tie_break_by_party_order(tied_candidates, party_lists)
     for dt, c, have, rate in tied:
         if c == chosen:
@@ -246,10 +329,6 @@ def choose_candidate_for_round(
     dt, chosen, have, rate = tied[0]
     return chosen, dt, have, rate, allow_used
 
-
-# -----------------------
-# Projection accounting
-# -----------------------
 
 def compute_projection_delta_for_chosen(
     chosen: str,
@@ -271,10 +350,6 @@ def compute_projection_delta_for_chosen(
     return newly_used
 
 
-# -----------------------
-# Spending: reset (legacy)
-# -----------------------
-
 def spend_winner_reset(
     cand: str,
     balances: List[float],
@@ -286,145 +361,20 @@ def spend_winner_reset(
             balances[gi] = 0.0
 
 
-# -----------------------
-# FIFO time-priority spending with tiers
-# -----------------------
-
-def fifo_balance_at(
-    t_now: float,
-    t_start: List[float],
-    weights: List[float],
-    i: int,
-) -> float:
-    w = weights[i]
-    if w <= EPS:
-        return 0.0
-    dt = t_now - t_start[i]
-    return w * dt if dt > 0 else 0.0
-
-
-def _available_credit_fifo(t_now: float, t_start: List[float], weights: List[float], indices: List[int]) -> float:
-    tot = 0.0
-    for i in indices:
-        w = weights[i]
-        if w <= EPS:
+def parse_spend_tiers(spec: str) -> List[List[str]]:
+    valid = {"base", "electorate", "party", "mega"}
+    tiers: List[List[str]] = []
+    for tier_str in spec.split(">"):
+        kinds = [k.strip() for k in tier_str.split(",") if k.strip()]
+        if not kinds:
             continue
-        dt = t_now - t_start[i]
-        if dt > 0:
-            tot += w * dt
-    return tot
-
-
-def _fifo_cutoff_tau(
-    t_now: float,
-    t_start: List[float],
-    weights: List[float],
-    indices: List[int],
-    amount: float,
-) -> float:
-    """
-    Find τ ≤ t_now such that sum_i w_i * max(0, τ - t_start[i]) = amount,
-    considering only indices list, and assuming amount <= total available credit up to t_now.
-    """
-    if amount <= 0:
-        return min(t_start[i] for i in indices) if indices else t_now
-
-    items: List[Tuple[float, float]] = []  # (t_start, weight)
-    for i in indices:
-        w = weights[i]
-        if w <= EPS:
-            continue
-        items.append((t_start[i], w))
-    if not items:
-        return t_now
-
-    items.sort(key=lambda x: x[0])
-    starts = [s for (s, _w) in items]
-    ws = [w for (_s, w) in items]
-
-    spent = 0.0
-    W = 0.0
-
-    cur = starts[0]
-    W = ws[0]
-    j = 0
-
-    while j + 1 < len(starts) and abs(starts[j + 1] - cur) <= 1e-18:
-        j += 1
-        W += ws[j]
-
-    while True:
-        nxt = t_now
-        if j + 1 < len(starts):
-            nxt = min(nxt, starts[j + 1])
-
-        if nxt < cur:
-            nxt = cur
-
-        cap = W * (nxt - cur)
-        if spent + cap >= amount - 1e-15:
-            if W <= EPS:
-                return cur
-            tau = cur + (amount - spent) / W
-            if tau > t_now:
-                tau = t_now
-            return tau
-
-        spent += cap
-        cur = nxt
-
-        if abs(cur - t_now) <= 1e-18:
-            return t_now
-
-        while j + 1 < len(starts) and abs(starts[j + 1] - cur) <= 1e-18:
-            j += 1
-            W += ws[j]
-        if j + 1 < len(starts):
-            j += 1
-            W += ws[j]
-            while j + 1 < len(starts) and abs(starts[j + 1] - cur) <= 1e-18:
-                j += 1
-                W += ws[j]
-
-
-def _fifo_spend_exact_amount(
-    t_now: float,
-    t_start: List[float],
-    weights: List[float],
-    indices: List[int],
-    amount: float,
-) -> float:
-    """
-    Spend amount by FIFO (oldest credit first) within these indices.
-    Implemented by computing cutoff τ and advancing start times to τ (or t_now if drained).
-    Returns amount actually spent (<= amount).
-    """
-    if amount <= 0 or not indices:
-        return 0.0
-
-    avail = _available_credit_fifo(t_now, t_start, weights, indices)
-    if avail <= EPS:
-        return 0.0
-
-    if amount >= avail - 1e-15:
-        for i in indices:
-            t_start[i] = t_now
-        return avail
-
-    tau = _fifo_cutoff_tau(t_now, t_start, weights, indices, amount)
-
-    spent = 0.0
-    for i in indices:
-        w = weights[i]
-        if w <= EPS:
-            continue
-        s = t_start[i]
-        if tau > s:
-            spent_i = w * (tau - s)
-            spent += spent_i
-            t_start[i] = tau
-
-    return min(spent, amount)
+        for k in kinds:
+            if k not in valid:
+                raise ValueError(f"Invalid kind '{k}' in spend_tiers. Valid: {sorted(valid)}")
+        tiers.append(kinds)
+    if not tiers:
+        raise ValueError("spend_tiers produced zero tiers.")
+    return tiers
 
 
 def spend_winner_fifo_time_priority_tiers(
@@ -438,25 +388,12 @@ def spend_winner_fifo_time_priority_tiers(
     spend_tiers: List[List[str]],
     tier_within_mode: str = "combined_fifo",
 ) -> None:
-    """
-    Spend exactly 1 seat value by FIFO time priority with user-defined tiers.
-
-    spend_tiers: list of tiers, each tier is a list of kinds, e.g.
-      [["base"], ["party"], ["electorate","mega"]]
-
-    tier_within_mode:
-      - "combined_fifo": pool all kinds in the tier and run one FIFO cutoff
-      - "separate_by_kind": run FIFO cutoff per kind in tier order (as listed)
-    """
     need = 1.0
-
-    # Pre-partition active supporter indices by kind
     by_kind: Dict[str, List[int]] = {}
     for gi in supporters.get(cand, []):
         if not active_mask[gi]:
             continue
-        k = groups[gi].kind
-        by_kind.setdefault(k, []).append(gi)
+        by_kind.setdefault(groups[gi].kind, []).append(gi)
 
     for tier in spend_tiers:
         if need <= EPS:
@@ -472,7 +409,6 @@ def spend_winner_fifo_time_priority_tiers(
                 spent = _fifo_spend_exact_amount(t_now, t_start, weights, idxs, need)
                 need -= spent
         else:
-            # combined_fifo default
             idxs_all: List[int] = []
             for k in tier:
                 idxs_all.extend(by_kind.get(k, []))
@@ -480,5 +416,3 @@ def spend_winner_fifo_time_priority_tiers(
                 continue
             spent = _fifo_spend_exact_amount(t_now, t_start, weights, idxs_all, need)
             need -= spent
-
-    # If need > 0, upstream dt/have consistency is broken; we do not force negatives.
