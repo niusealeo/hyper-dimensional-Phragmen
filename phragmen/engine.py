@@ -32,6 +32,8 @@ ROUND_FIELDS = [
     "allow_only_used",
     "spend_mode",
     "dt0_tie_rule",
+    "spend_tiers",
+    "tier_within_mode",
 ]
 
 QUOTA_FIELDS = [
@@ -285,8 +287,21 @@ def spend_winner_reset(
 
 
 # -----------------------
-# FIFO time-priority spending
+# FIFO time-priority spending with tiers
 # -----------------------
+
+def fifo_balance_at(
+    t_now: float,
+    t_start: List[float],
+    weights: List[float],
+    i: int,
+) -> float:
+    w = weights[i]
+    if w <= EPS:
+        return 0.0
+    dt = t_now - t_start[i]
+    return w * dt if dt > 0 else 0.0
+
 
 def _available_credit_fifo(t_now: float, t_start: List[float], weights: List[float], indices: List[int]) -> float:
     tot = 0.0
@@ -327,21 +342,17 @@ def _fifo_cutoff_tau(
     starts = [s for (s, _w) in items]
     ws = [w for (_s, w) in items]
 
-    # Sweep segments
     spent = 0.0
     W = 0.0
 
-    # Start at the smallest start time
     cur = starts[0]
     W = ws[0]
     j = 0
 
-    # If multiple have same start
     while j + 1 < len(starts) and abs(starts[j + 1] - cur) <= 1e-18:
         j += 1
         W += ws[j]
 
-    # Next change points are either next start time or t_now
     while True:
         nxt = t_now
         if j + 1 < len(starts):
@@ -352,7 +363,6 @@ def _fifo_cutoff_tau(
 
         cap = W * (nxt - cur)
         if spent + cap >= amount - 1e-15:
-            # Solve within this segment
             if W <= EPS:
                 return cur
             tau = cur + (amount - spent) / W
@@ -366,14 +376,12 @@ def _fifo_cutoff_tau(
         if abs(cur - t_now) <= 1e-18:
             return t_now
 
-        # Add next group(s)
         while j + 1 < len(starts) and abs(starts[j + 1] - cur) <= 1e-18:
             j += 1
             W += ws[j]
         if j + 1 < len(starts):
             j += 1
             W += ws[j]
-            # absorb any equals
             while j + 1 < len(starts) and abs(starts[j + 1] - cur) <= 1e-18:
                 j += 1
                 W += ws[j]
@@ -387,7 +395,7 @@ def _fifo_spend_exact_amount(
     amount: float,
 ) -> float:
     """
-    Spend exactly 'amount' by FIFO (oldest credit first) within these indices.
+    Spend amount by FIFO (oldest credit first) within these indices.
     Implemented by computing cutoff τ and advancing start times to τ (or t_now if drained).
     Returns amount actually spent (<= amount).
     """
@@ -399,14 +407,12 @@ def _fifo_spend_exact_amount(
         return 0.0
 
     if amount >= avail - 1e-15:
-        # Drain all: set their start to now
         for i in indices:
             t_start[i] = t_now
         return avail
 
     tau = _fifo_cutoff_tau(t_now, t_start, weights, indices, amount)
 
-    # Advance start times up to τ where applicable
     spent = 0.0
     for i in indices:
         w = weights[i]
@@ -414,16 +420,14 @@ def _fifo_spend_exact_amount(
             continue
         s = t_start[i]
         if tau > s:
-            # spent from [s, tau]
             spent_i = w * (tau - s)
             spent += spent_i
             t_start[i] = tau
 
-    # Numerical trim: we may have spent slightly > amount due to floating error; clamp not needed for t_start.
     return min(spent, amount)
 
 
-def spend_winner_fifo_time_priority(
+def spend_winner_fifo_time_priority_tiers(
     cand: str,
     groups: List[Group],
     t_now: float,
@@ -431,46 +435,50 @@ def spend_winner_fifo_time_priority(
     weights: List[float],
     supporters: Dict[str, List[int]],
     active_mask: List[bool],
-    priority: List[str],
+    spend_tiers: List[List[str]],
+    tier_within_mode: str = "combined_fifo",
 ) -> None:
     """
-    Spend exactly 1 seat value by FIFO time priority, tiered:
-      base → electorate → party → mega
+    Spend exactly 1 seat value by FIFO time priority with user-defined tiers.
 
-    Only spend from indices that are active this round (active_mask True).
-    Dormant quota reserves remain untouched.
+    spend_tiers: list of tiers, each tier is a list of kinds, e.g.
+      [["base"], ["party"], ["electorate","mega"]]
+
+    tier_within_mode:
+      - "combined_fifo": pool all kinds in the tier and run one FIFO cutoff
+      - "separate_by_kind": run FIFO cutoff per kind in tier order (as listed)
     """
     need = 1.0
 
-    by_kind: Dict[str, List[int]] = {k: [] for k in priority}
+    # Pre-partition active supporter indices by kind
+    by_kind: Dict[str, List[int]] = {}
     for gi in supporters.get(cand, []):
         if not active_mask[gi]:
             continue
         k = groups[gi].kind
-        if k in by_kind:
-            by_kind[k].append(gi)
+        by_kind.setdefault(k, []).append(gi)
 
-    for k in priority:
+    for tier in spend_tiers:
         if need <= EPS:
             break
-        idxs = by_kind.get(k, [])
-        if not idxs:
-            continue
-        spent = _fifo_spend_exact_amount(t_now, t_start, weights, idxs, need)
-        need -= spent
 
-    # If need > 0, it means the candidate wasn't actually payable; that's a consistency bug upstream.
-    # We fail safe by leaving it partially unpaid (no negative effects), but it should not happen.
+        if tier_within_mode == "separate_by_kind":
+            for k in tier:
+                if need <= EPS:
+                    break
+                idxs = by_kind.get(k, [])
+                if not idxs:
+                    continue
+                spent = _fifo_spend_exact_amount(t_now, t_start, weights, idxs, need)
+                need -= spent
+        else:
+            # combined_fifo default
+            idxs_all: List[int] = []
+            for k in tier:
+                idxs_all.extend(by_kind.get(k, []))
+            if not idxs_all:
+                continue
+            spent = _fifo_spend_exact_amount(t_now, t_start, weights, idxs_all, need)
+            need -= spent
 
-
-def fifo_balance_at(
-    t_now: float,
-    t_start: List[float],
-    weights: List[float],
-    i: int,
-) -> float:
-    w = weights[i]
-    if w <= EPS:
-        return 0.0
-    dt = t_now - t_start[i]
-    return w * dt if dt > 0 else 0.0
+    # If need > 0, upstream dt/have consistency is broken; we do not force negatives.
