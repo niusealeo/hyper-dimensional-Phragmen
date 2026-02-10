@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Optional, Tuple
 
 
 EPS = 1e-12
@@ -12,7 +12,7 @@ WeightFn = Callable[[float], float]
 @dataclass(frozen=True)
 class Group:
     gid: str
-    kind: str  # "base" | "party" | "electorate" | "mega"
+    kind: str  # "base" | "mega" | "party" | "electorate"
     approvals: Tuple[str, ...]
     weight: float
     quota_floor: Optional[float] = None
@@ -37,6 +37,7 @@ class ElectionProfile:
     scale_base_weight: WeightFn
     scale_mega_rel_weight: WeightFn
     scale_party_rel_weight: WeightFn
+    scale_electorate_rel_weight: WeightFn
 
     # Thresholds (strict comparisons are used: > target)
     sig_target: float
