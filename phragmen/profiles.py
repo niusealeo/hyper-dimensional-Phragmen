@@ -16,8 +16,9 @@ PROFILES: Dict[str, ElectionProfile] = {
         description=(
             "Default behaviour: identity scaling for all weights; "
             "mega/party/electorate groups behave as soft quota-floor reserve racers; "
-            "signature repeats on prefix to projection > 5/9; "
-            "completion when projection > 2/3."
+            "overshoot leftovers are preserved via partial priority spending "
+            "(base→electorate→party→mega); "
+            "dt=0 ties choose max available spend (then party tie-break)."
         ),
         scale_base_weight=_identity,
         scale_mega_rel_weight=_identity,
@@ -25,6 +26,8 @@ PROFILES: Dict[str, ElectionProfile] = {
         scale_electorate_rel_weight=_identity,
         sig_target=5 / 9,
         completion_target=2 / 3,
+        spend_mode="partial_priority",
+        dt0_tie_rule="max_have_then_party_then_name",
         prompt_block=19,
     )
 }
