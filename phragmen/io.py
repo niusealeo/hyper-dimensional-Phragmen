@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
+import csv
 import math
+import os
 
 from .types import ElectionProfile, Group
 
 
 # ---------------------------
-# Helpers
+# Small utilities
 # ---------------------------
 
 def canon_set(xs: List[str]) -> Tuple[str, ...]:
@@ -24,6 +26,35 @@ def candidates_from_groups(groups: List[Group]) -> Set[str]:
     for g in groups:
         s.update(g.approvals)
     return s
+
+
+def extract_candidates_from_defs(raw_defs: List[dict]) -> Set[str]:
+    """
+    Extract candidate names from list definitions that may store candidates under:
+      - "candidates"
+      - "approvals"
+    Used for party + electorate candidate universe expansion before simplification.
+    """
+    out: Set[str] = set()
+    for d in raw_defs or []:
+        xs = d.get("candidates", d.get("approvals", [])) or []
+        for c in xs:
+            out.add(str(c))
+    return out
+
+
+def write_meta_csv(path: str, rows: List[dict]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    keys: List[str] = []
+    for r in rows:
+        for k in r.keys():
+            if k not in keys:
+                keys.append(k)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
 
 
 # ---------------------------
@@ -169,7 +200,6 @@ def parse_party_ballots(
             derived_mode = "abs_weight_population"
             saturation_assumed = (abs(qf - (1.0 / 3.0)) <= 1e-12)
 
-        # Apply profile scaling to rel_weight (still identity for general_alpha)
         rel_weight = float(profile.scale_party_rel_weight(float(rel_weight)))
 
         ordered_raw = p.get("candidates", p.get("approvals", []))
@@ -283,7 +313,6 @@ def parse_mega_ballots(
             derived_mode = "abs_weight_population"
             saturation_assumed = (abs(qf - (1.0 / 3.0)) <= 1e-12)
 
-        # Apply profile scaling to rel_weight (still identity for general_alpha)
         rel_weight = float(profile.scale_mega_rel_weight(float(rel_weight)))
 
         manual = set(str(x) for x in (m.get("approvals") or []))
@@ -327,6 +356,124 @@ def parse_mega_ballots(
             "quota_floor": quota_floor,
             "approvals_original": len(manual),
             "approvals_auto": len(auto),
+            "approvals_simplified": len(approvals),
+            "saturation_assumed_min_share": saturation_assumed,
+            "dropped_from_algorithm": False,
+        })
+
+    return groups, meta_rows
+
+
+# ---------------------------
+# Electorate ballots
+# ---------------------------
+
+def parse_electorate_ballots(
+    raw_electorates: List[dict],
+    total_voter_ballots: float,
+    candidate_set: Set[str],
+    profile: ElectionProfile,
+) -> Tuple[List[Group], List[dict]]:
+    """
+    Electorate ballot groups:
+      - behave like mega/party quota groups in the engine (soft quota-floor reserve)
+      - approvals are limited to candidates registered in that electorate
+      - inputs support abs_weight+population OR quota_floor
+      - no auto_include (for now)
+    """
+    groups: List[Group] = []
+    meta_rows: List[dict] = []
+
+    for i, e in enumerate(raw_electorates or []):
+        gid = str(e.get("id", f"E:{i}"))
+
+        quota_floor = e.get("quota_floor", None)
+        abs_weight = e.get("abs_weight", e.get("weight", None))
+        population = e.get("population", None)
+
+        share = None
+        rel_weight = None
+        derived_mode = None
+        saturation_assumed = False
+        pop_val = None
+        abs_val = None
+
+        if quota_floor is not None:
+            qf = float(quota_floor)
+            if qf <= 0:
+                continue
+            share, saturation_assumed = invert_share_from_quota_floor(qf)
+            rel_weight = share * total_voter_ballots
+            derived_mode = "quota_floor"
+            if population is not None:
+                pop_val = float(population)
+                abs_val = float(abs_weight) if abs_weight is not None else (share * pop_val)
+            else:
+                pop_val = None
+                abs_val = float(abs_weight) if abs_weight is not None else None
+            quota_floor = qf
+        else:
+            if abs_weight is None or population is None:
+                continue
+            abs_val = float(abs_weight)
+            pop_val = float(population)
+            if abs_val <= 0 or pop_val <= 0:
+                continue
+            share, rel_weight, qf = derive_quota_and_rel_weight_from_abs(abs_val, pop_val, total_voter_ballots)
+            quota_floor = qf
+            derived_mode = "abs_weight_population"
+            saturation_assumed = (abs(qf - (1.0 / 3.0)) <= 1e-12)
+
+        rel_weight = float(profile.scale_electorate_rel_weight(float(rel_weight)))
+
+        raw_cands = e.get("candidates", e.get("approvals", [])) or []
+        ordered = [str(x) for x in raw_cands]
+
+        # de-dupe preserve order (for meta only)
+        seen: Set[str] = set()
+        ordered_dedup: List[str] = []
+        for c in ordered:
+            if c not in seen:
+                seen.add(c)
+                ordered_dedup.append(c)
+
+        approvals = tuple(sorted(set(ordered_dedup) & candidate_set))
+
+        if len(approvals) == 0:
+            meta_rows.append({
+                "id": gid, "kind": "electorate",
+                "mode": derived_mode,
+                "population": pop_val if pop_val is not None else "",
+                "abs_weight": abs_val if abs_val is not None else "",
+                "share": share,
+                "rel_weight": rel_weight,
+                "quota_floor": quota_floor,
+                "electorate_candidate_list_len": len(ordered_dedup),
+                "approvals_simplified": 0,
+                "saturation_assumed_min_share": saturation_assumed,
+                "dropped_from_algorithm": True,
+            })
+            continue
+
+        groups.append(Group(
+            gid=gid, kind="electorate",
+            approvals=approvals,
+            weight=float(rel_weight),
+            quota_floor=float(quota_floor),
+            population=float(pop_val) if pop_val is not None else None,
+            abs_weight=float(abs_val) if abs_val is not None else None,
+            share=float(share) if share is not None else None,
+        ))
+
+        meta_rows.append({
+            "id": gid, "kind": "electorate",
+            "mode": derived_mode,
+            "population": pop_val if pop_val is not None else "",
+            "abs_weight": abs_val if abs_val is not None else "",
+            "share": share,
+            "rel_weight": rel_weight,
+            "quota_floor": quota_floor,
+            "electorate_candidate_list_len": len(ordered_dedup),
             "approvals_simplified": len(approvals),
             "saturation_assumed_min_share": saturation_assumed,
             "dropped_from_algorithm": False,
