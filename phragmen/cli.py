@@ -12,15 +12,11 @@ from .engine import (
     ROUND_FIELDS, QUOTA_FIELDS, PROJ_FIELDS,
     apply_time_step, build_supporters, choose_candidate_for_round,
     compute_projection_delta_for_chosen, compute_quota_active_info,
-    spend_winner
+    spend_winner_reset, spend_winner_partial_priority,
 )
 from .profiles import get_profile, list_profiles
 from .types import ElectionProfile, Group
 
-
-# ---------------------------
-# CSV writers
-# ---------------------------
 
 def open_csv(path: str, fieldnames: List[str]):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -29,10 +25,6 @@ def open_csv(path: str, fieldnames: List[str]):
     w.writeheader()
     return f, w
 
-
-# ---------------------------
-# Profile selection
-# ---------------------------
 
 def choose_profile_interactive() -> ElectionProfile:
     profiles = list_profiles()
@@ -72,10 +64,6 @@ def prompt_more_iters(default: int) -> Optional[int]:
         print("Please enter a positive integer or 'q'.")
 
 
-# ---------------------------
-# Helpers for reading intervals from CSV
-# ---------------------------
-
 def recompute_intervals_from_rounds_csv(rounds_csv_path: str) -> Tuple[List[str], List[Tuple[float, float]]]:
     winners: List[str] = []
     intervals: List[Tuple[float, float]] = []
@@ -106,10 +94,6 @@ def prefix_until_projection_strict_gt(winners: List[str], intervals: List[Tuple[
     return out
 
 
-# ---------------------------
-# Core runner (single pass)
-# ---------------------------
-
 def run_sequential(
     label: str,
     candidates: List[str],
@@ -119,13 +103,15 @@ def run_sequential(
     party_groups: List[Group],
     electorate_groups: List[Group],
     party_lists: Dict[str, List[str]],
-    stop_when_proj_gt: Optional[float],            # stop when p_total > threshold (strict)
-    prefix_allow_only_init: Optional[List[str]],   # higher priority pool
-    ban_set: Optional[Set[str]],                   # always banned
-    iter_allow_only_init: Optional[List[str]],     # lower priority pool
+    stop_when_proj_gt: Optional[float],
+    prefix_allow_only_init: Optional[List[str]],
+    ban_set: Optional[Set[str]],
+    iter_allow_only_init: Optional[List[str]],
     rounds_csv_path: Optional[str],
     quota_csv_path: Optional[str],
     proj_csv_path: Optional[str],
+    spend_mode: str,
+    dt0_tie_rule: str,
 ) -> dict:
     groups = base_groups + mega_groups + party_groups + electorate_groups
     weights = [g.weight for g in groups]
@@ -194,7 +180,8 @@ def run_sequential(
                 remaining,
                 balances, weights, supporters, active_mask,
                 party_lists,
-                allow_only_pool=pool_to_use
+                allow_only_pool=pool_to_use,
+                dt0_tie_rule=dt0_tie_rule,
             )
 
             apply_time_step(balances, weights, dt)
@@ -209,7 +196,19 @@ def run_sequential(
             p_total += delta_p
             used_voter_ballots_cum += newly_used_ballots
 
-            spend_winner(chosen, balances, supporters, active_mask)
+            # Spend winner according to mode
+            if spend_mode == "reset":
+                spend_winner_reset(chosen, groups, balances, supporters, active_mask)
+            else:
+                spend_winner_partial_priority(
+                    chosen,
+                    groups,
+                    balances,
+                    supporters,
+                    active_mask,
+                    priority=["base", "electorate", "party", "mega"],
+                )
+
             winners.append(chosen)
             winners_set.add(chosen)
 
@@ -248,6 +247,8 @@ def run_sequential(
                     "iter_allow_pool_size_before": iter_size_before,
                     "allow_pool_source": pool_source,
                     "allow_only_used": 1 if allow_used else 0,
+                    "spend_mode": spend_mode,
+                    "dt0_tie_rule": dt0_tie_rule,
                 })
                 rounds_f.flush()
 
@@ -317,6 +318,8 @@ def run_full_chamber_completion(
     prefix_allow: List[str],
     ban: Set[str],
     completion_target: float,
+    spend_mode: str,
+    dt0_tie_rule: str,
 ) -> dict:
     cap = max(seats, len(candidates_list))
     label = "converged_full"
@@ -340,6 +343,8 @@ def run_full_chamber_completion(
         rounds_csv_path=rounds_csv,
         quota_csv_path=quota_csv,
         proj_csv_path=proj_csv,
+        spend_mode=spend_mode,
+        dt0_tie_rule=dt0_tie_rule,
     )
 
     winners, intervals = recompute_intervals_from_rounds_csv(rounds_csv)
@@ -366,12 +371,8 @@ def run_full_chamber_completion(
     }
 
 
-# ---------------------------
-# Main
-# ---------------------------
-
 def main(argv: Optional[List[str]] = None) -> None:
-    ap = argparse.ArgumentParser(description="Sequential Phragmén (library layout) with profiles + electorates.")
+    ap = argparse.ArgumentParser(description="Sequential Phragmén (profiles + electorates + overshoot spending).")
     ap.add_argument("input_json", help="Election JSON file.")
     ap.add_argument("--outdir", default="out", help="Output directory for CSVs.")
     ap.add_argument("--quota_meta_csv", default=None, help="Write normalized mega/party/electorate meta CSV (path).")
@@ -380,40 +381,37 @@ def main(argv: Optional[List[str]] = None) -> None:
                     help="Disable interactive prompts (profile selection + more-iters).")
     ap.add_argument("--profile", default=None,
                     help="Profile key (e.g. general_alpha). If omitted, prompt (unless --no_prompt).")
+
+    # Explicit knobs (override profile defaults)
+    ap.add_argument("--spend_mode", choices=["reset", "partial_priority"], default=None,
+                    help="How to spend balances on election. Overrides profile.")
+    ap.add_argument("--dt0_tie_rule", choices=["party_then_name", "max_have_then_party_then_name"], default=None,
+                    help="How to break dt=0 ties. Overrides profile.")
     args = ap.parse_args(argv)
 
-    # Choose profile
     if args.profile is None:
-        if args.no_prompt:
-            profile = get_profile("general_alpha")
-        else:
-            profile = choose_profile_interactive()
+        profile = get_profile("general_alpha") if args.no_prompt else choose_profile_interactive()
     else:
-        try:
-            profile = get_profile(args.profile)
-        except KeyError as e:
-            raise SystemExit(str(e))
+        profile = get_profile(args.profile)
+
+    spend_mode = args.spend_mode or profile.spend_mode
+    dt0_tie_rule = args.dt0_tie_rule or profile.dt0_tie_rule
 
     with open(args.input_json, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     seats = int(data["seats"])
 
-    # Parse base ballots (profile-aware)
     base_groups = io_mod.canonicalize_base_ballots(data.get("ballots", []), profile=profile)
     total_voter_ballots = io_mod.total_normal_ballots_weight(base_groups)
 
-    # Candidate meta
     candidate_meta = io_mod.parse_candidate_meta(data.get("candidate_meta") or {})
 
-    # Candidate universe: declared + base approvals
     candidates: Set[str] = set(str(c) for c in data.get("candidates", []))
     candidates.update(io_mod.candidates_from_groups(base_groups))
 
-    # Prefix intervention
     prefix_allow, ban = io_mod.parse_prefix_intervention(data)
 
-    # Party ballots (may add candidates)
     party_groups, party_lists, party_meta, party_cands = io_mod.parse_party_ballots(
         data.get("party_ballots", []),
         total_voter_ballots=total_voter_ballots,
@@ -421,10 +419,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     candidates.update(party_cands)
 
-    # Electorate defs may add candidates too (their registered list)
     candidates.update(io_mod.extract_candidates_from_defs(data.get("electorate_ballots", [])))
 
-    # Now simplify mega + electorate against full candidate universe
     mega_groups, mega_meta = io_mod.parse_mega_ballots(
         data.get("mega_ballots", []),
         total_voter_ballots=total_voter_ballots,
@@ -447,7 +443,6 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     os.makedirs(args.outdir, exist_ok=True)
 
-    # PASS 1
     pass1_label = "pass01"
     pass1_rounds = os.path.join(args.outdir, f"{pass1_label}_rounds.csv")
     pass1_quota = os.path.join(args.outdir, f"{pass1_label}_quota.csv")
@@ -469,12 +464,13 @@ def main(argv: Optional[List[str]] = None) -> None:
         rounds_csv_path=pass1_rounds,
         quota_csv_path=pass1_quota,
         proj_csv_path=pass1_proj,
+        spend_mode=spend_mode,
+        dt0_tie_rule=dt0_tie_rule,
     )
 
     pass1_winners, pass1_intervals = recompute_intervals_from_rounds_csv(pass1_rounds)
     pass1_prefix = prefix_until_projection_strict_gt(pass1_winners, pass1_intervals, profile.sig_target)
 
-    # Signature map: stop at first repeat (covers convergence + cycles)
     seen: Dict[Tuple[str, ...], int] = {tuple(pass1_prefix): 1}
     seen_label: Dict[Tuple[str, ...], str] = {tuple(pass1_prefix): "pass01"}
 
@@ -517,6 +513,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 rounds_csv_path=A_rounds,
                 quota_csv_path=A_quota,
                 proj_csv_path=A_proj,
+                spend_mode=spend_mode,
+                dt0_tie_rule=dt0_tie_rule,
             )
 
             A_winners, _A_intervals = recompute_intervals_from_rounds_csv(A_rounds)
@@ -542,6 +540,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 rounds_csv_path=B_rounds,
                 quota_csv_path=B_quota,
                 proj_csv_path=B_proj,
+                spend_mode=spend_mode,
+                dt0_tie_rule=dt0_tie_rule,
             )
 
             B_winners, B_intervals = recompute_intervals_from_rounds_csv(B_rounds)
@@ -588,10 +588,14 @@ def main(argv: Optional[List[str]] = None) -> None:
             prefix_allow=prefix_allow,
             ban=ban,
             completion_target=profile.completion_target,
+            spend_mode=spend_mode,
+            dt0_tie_rule=dt0_tie_rule,
         )
 
     print(json.dumps({
         "profile": profile.key,
+        "spend_mode": spend_mode,
+        "dt0_tie_rule": dt0_tie_rule,
         "status": "repeat_signature_found" if solved else "not_converged",
         "repeat_at_iteration": solved_iter,
         "twin_iteration": twin_iter,
