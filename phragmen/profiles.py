@@ -15,12 +15,14 @@ PROFILES: Dict[str, ElectionProfile] = {
         name="General Alpha",
         description=(
             "Default behaviour: identity scaling for all weights; "
+            "mega/party/electorate groups behave as soft quota-floor reserve racers; "
             "signature repeats on prefix to projection > 5/9; "
             "completion when projection > 2/3."
         ),
         scale_base_weight=_identity,
         scale_mega_rel_weight=_identity,
         scale_party_rel_weight=_identity,
+        scale_electorate_rel_weight=_identity,
         sig_target=5 / 9,
         completion_target=2 / 3,
         prompt_block=19,
