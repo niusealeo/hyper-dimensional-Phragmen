@@ -450,7 +450,7 @@ def write_meta_csv(path: str, groups: List[Group]) -> None:
 
 def parse_party_ballots(
     party_defs: List[dict],
-    wglobal2: float,
+    wglobal5: float,
     wglobal4: float,
     partyrock_abs_by_party: Optional[Dict[str, float]],
     partyrock_norm_sum_by_party: Optional[Dict[str, float]],
@@ -472,7 +472,7 @@ def parse_party_ballots(
         #   wp1 = abs party weight (json)
         #   wp2 = max(wp1, sum(partyrock abs for party))
         #   share1 = wp2 / wglobal4
-        #   share2 = wp2 / wglobal2
+        #   share2 = wp3 / wglobal5
         #   share_used = max(share1, share2)
         #   rel_weight = N_used * quota_floor(share_used)
         # Legacy support: if explicit population/quota_floor present, respect it.
@@ -488,8 +488,11 @@ def parse_party_ballots(
             wp1 = float(abs_weight)
             pr_abs = float((partyrock_abs_by_party or {}).get(gid, 0.0))
             wp2 = max(wp1, pr_abs)
+
+            wp3 = float((partyrock_norm_sum_by_party or {}).get(gid, 0.0))
+
             share1 = (wp2 / wglobal4) if wglobal4 > 0 else 0.0
-            share2 = (wp2 / wglobal2) if wglobal2 > 0 else 0.0
+            share2 = (wp3 / wglobal5) if wglobal5 > 0 else 0.0
             share_used = max(share1, share2)
             share = share_used
             qf = quota_floor_from_share(share_used)
@@ -498,7 +501,7 @@ def parse_party_ballots(
             meta_extra.update({
                 "wp1": wp1,
                 "wp2": wp2,
-                "wp3": float((partyrock_norm_sum_by_party or {}).get(gid, 0.0)),
+                "wp3": wp3,
                 "share1": share1,
                 "share2": share2,
                 "share_used": share_used,
