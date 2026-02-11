@@ -1009,13 +1009,20 @@ def parse_partyrock_ballots(
       - wpr1 = abs PartyRock weight (json)
       - we1 = electorate abs enrollment (electorate abs_weight)
       - we2 = electorate turnout (electorate meta.turnout alias)
-      - we3 = max(we1, sum(partyrock abs for electorate), sum(base abs for electorate))
+      - we3 = max(we2, sum(partyrock abs for electorate), sum(base abs for electorate))
 
     Electorate-normalized weight:
         wpr2 = wpr1 * we1 / we3
 
-    Local share (for future quota use):
+    Local share (for quota floor):
         share1 = wpr1 / we2
+
+    Arena N mapping:
+        N_arena = we3
+
+    Canonical quota rule:
+        quota_floor = min((2/3)*share1, 1/3)
+        rel_weight = N_arena * quota_floor
     """
     groups: List[Group] = []
     meta: List[Group] = []
@@ -1028,7 +1035,8 @@ def parse_partyrock_ballots(
             return 0.0, 0.0, 0.0
         m = e.meta or {}
         we1 = float(e.abs_weight) if e.abs_weight is not None else 0.0
-        # we2 is the electorate turnout; prefer derived meta if present.
+
+        # we2: turnout (prefer explicit turnout meta if present)
         we2 = 0.0
         for k in ("we2", "turnout", "total_turnout", "voter_turnout"):
             if m.get(k) is not None:
@@ -1037,30 +1045,35 @@ def parse_partyrock_ballots(
                     break
                 except Exception:
                     pass
-        # we3 is the max-scale electorate competition pool.
+
+        # we3: local max-scale competition pool
         we3 = 0.0
-        for k in ("we3",):
-            if m.get(k) is not None:
-                try:
-                    we3 = float(m.get(k))
-                except Exception:
-                    we3 = 0.0
+        if m.get("we3") is not None:
+            try:
+                we3 = float(m.get("we3"))
+            except Exception:
+                we3 = 0.0
+
         if we3 <= 0:
             we3 = max(
                 we2,
                 float(m.get("counted_base_ballots", 0.0) or 0.0),
                 float(m.get("counted_partyrock_abs_weight", 0.0) or 0.0),
             )
+
         return float(we1), float(we2), float(we3)
+
+    cand_set = set(str(x) for x in candidate_set)
 
     i = 0
     for d in partyrock_defs or []:
         if not isinstance(d, dict):
             continue
+
+        # Preserve PartyRock input order for later tie-breaking list work
         raw_apps = [str(x) for x in (d.get("approvals", []) or [])]
-        # Preserve input order for PartyRock ballots (used later for tie-breaking construction).
         seen = set()
-        ordered = []
+        ordered: List[str] = []
         for x in raw_apps:
             x = str(x)
             if x.strip() == "":
@@ -1071,7 +1084,6 @@ def parse_partyrock_ballots(
             ordered.append(x)
 
         # Candidate universe filter
-        cand_set = set(str(x) for x in candidate_set)
         ordered = [c for c in ordered if c in cand_set]
         if not ordered:
             continue
@@ -1080,6 +1092,7 @@ def parse_partyrock_ballots(
         if not apps:
             continue
 
+        # Absolute weight (wpr1)
         try:
             abs_w = float(parse_numeric_optional(d.get("weight", 0.0), field="partyrock.weight") or 0.0)
         except Exception:
@@ -1087,6 +1100,7 @@ def parse_partyrock_ballots(
         if abs_w <= 0:
             continue
 
+        # Electorate id
         eid = d.get("electorate")
         if eid is None:
             eid = d.get("electorate_id")
@@ -1094,6 +1108,7 @@ def parse_partyrock_ballots(
             eid = d.get("electorate_gid")
         eid = str(eid) if eid is not None and str(eid).strip() != "" else "electorate_unknown"
 
+        # Party id
         pid = d.get("party")
         if pid is None:
             pid = d.get("party_id")
@@ -1103,8 +1118,14 @@ def parse_partyrock_ballots(
 
         e = elect_by_gid.get(eid)
         we1, we2, we3 = _electorate_we2_we3(e)
-        wpr2 = (abs_w * we1 / we3) if we3 > 0 and we1 > 0 else 0.0
+
+        # wpr2 electorate-normalised
+        wpr2 = (abs_w * we1 / we3) if (we3 > 0 and we1 > 0) else 0.0
+
+        # share1 uses we2 as denominator
         share1 = (abs_w / we2) if we2 > 0 else 0.0
+
+        # quota + rel_weight using arena N=we3
         qf = quota_floor_from_share(share1) if we2 > 0 else 0.0
         rel_w = normalize_rel_weight_from_share(share1, we3) if we2 > 0 else 0.0
 
@@ -1121,17 +1142,26 @@ def parse_partyrock_ballots(
                 "source": "partyrock_ballots",
                 "electorate": eid,
                 "party": pid,
-                "we1": we1,
-                "we2": we2,
-                "we3": we3,
+
+                # electorate scalars
+                "we1": float(we1),
+                "we2": float(we2),
+                "we3": float(we3),
+
+                # partyrock scalars
                 "wpr1": float(abs_w),
                 "wpr2": float(wpr2),
+
+                # local share definition
                 "share1": float(share1),
+                "share_denom": float(we2),   # share1 = wpr1 / we2
+
+                # quota projection info
+                "quota_floor": float(qf),
+                "N_arena": float(we3),
                 "rel_weight": float(rel_w),
-                "N_arena": float(we3),
-                "share_denom": float(denom),
-                "N_arena": float(we3),
-                "share_denom": float(denom),
+
+                # ordered list for later tie-breaking/list work
                 "ordered_candidates": list(ordered),
             },
         )
