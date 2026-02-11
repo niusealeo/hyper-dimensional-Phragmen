@@ -259,15 +259,24 @@ This is an illustrative example (minimal fields shown):
 ```json
 {
   "seats": 10,
-  "total_population": 5000000,
-  "total_enrollment": 4200000,
-  "total_turnout": 3100000,
+  "total_population": 5300000,
+  "total_enrollment": 4100000,
+  "total_turnout": 3300000,
 
   "candidates": ["A", "B", "C"],
 
+  "candidate_meta": {
+    "A": {
+      "megas": ["M02"]
+    },
+    "D": {
+      "megas": ["M01"],
+    }
+  },
+
   "ballots": [
     {"weight": 1, "approvals": ["A", "B"], "electorate": "E01"},
-    {"weight": 2, "approvals": ["B"], "electorate": "E02"}
+    {"weight": 2, "approvals": ["B","E"], "electorate": "E02"}
   ],
 
   "electorate_ballots": [
@@ -284,7 +293,7 @@ This is an illustrative example (minimal fields shown):
   ],
 
   "partyrock_ballots": [
-    {"weight": 1000, "approvals": ["C"], "electorate": "E02", "party": "P01"}
+    {"weight": 1000, "approvals": ["C","D"], "electorate": "E02", "party": "P01"}
   ],
 
   "megarock_ballots": [
