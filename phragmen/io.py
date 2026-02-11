@@ -304,61 +304,101 @@ def parse_prefix_intervention(data: dict) -> Tuple[List[str], Set[str]]:
     return allow_list, ban_set
 
 
+# ============================================================
+# SAFE NUMERIC EXPRESSION PARSER
+# ============================================================
 
-_NUM_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div)
-_NUM_ALLOWED_UNARYOPS = (ast.UAdd, ast.USub)
+_ALLOWED_BINOPS = {
+    ast.Add: lambda a, b: a + b,
+    ast.Sub: lambda a, b: a - b,
+    ast.Mult: lambda a, b: a * b,
+    ast.Div: lambda a, b: a / b,
+    ast.Pow: lambda a, b: a ** b,
+}
+
+_ALLOWED_UNARYOPS = {
+    ast.UAdd: lambda a: +a,
+    ast.USub: lambda a: -a,
+}
+
 
 def parse_numeric(value: Any, *, field: str = "") -> float:
-    """Parse numeric inputs that may be numbers or string expressions.
+    """
+    Parse numeric inputs that may be numbers or string expressions.
 
     Supported:
-      - int/float
-      - ratio strings like "5/9", "1000/3"
-      - simple arithmetic expressions with + - * / and parentheses (no names, no functions)
+        - int/float
+        - scientific notation (1e6, 5e-3)
+        - fractions ("5/9", "1000/3")
+        - arithmetic expressions with + - * / ** (or ^ mapped to **)
+        - parentheses
 
-    Raises ValueError on invalid expressions.
+    Rejected:
+        - names
+        - function calls
+        - comparisons
+        - boolean operators
+        - bitwise operators
     """
+
     if value is None:
         raise ValueError(f"Missing numeric value for {field}" if field else "Missing numeric value")
+
     if isinstance(value, (int, float)):
         return float(value)
-    if isinstance(value, str):
-        s = value.strip()
-        if s == "":
-            raise ValueError(f"Empty numeric string for {field}" if field else "Empty numeric string")
-        try:
-            return float(s)
-        except Exception:
-            pass
-        try:
-            node = ast.parse(s, mode="eval")
-        except Exception as e:
-            raise ValueError(f"Invalid numeric expression for {field}: {value!r}") from e
 
-        def _eval(n: ast.AST) -> float:
-            if isinstance(n, ast.Expression):
-                return _eval(n.body)
-            if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+    if not isinstance(value, str):
+        raise ValueError(f"Unsupported numeric type for {field}: {type(value)}")
+
+    s = value.strip()
+    if s == "":
+        raise ValueError(f"Empty numeric string for {field}" if field else "Empty numeric string")
+
+    # Map caret exponent to Python exponent
+    s = s.replace("^", "**")
+
+    # Try simple float first (fast path)
+    try:
+        return float(s)
+    except Exception:
+        pass
+
+    try:
+        node = ast.parse(s, mode="eval")
+    except Exception as e:
+        raise ValueError(f"Invalid numeric expression for {field}: {value!r}") from e
+
+    def _eval(n: ast.AST) -> float:
+        if isinstance(n, ast.Expression):
+            return _eval(n.body)
+
+        if isinstance(n, ast.Constant):
+            if isinstance(n.value, (int, float)):
                 return float(n.value)
-            if isinstance(n, ast.Num):
-                return float(n.n)
-            if isinstance(n, ast.UnaryOp) and isinstance(n.op, _NUM_ALLOWED_UNARYOPS):
-                v = _eval(n.operand)
-                return +v if isinstance(n.op, ast.UAdd) else -v
-            if isinstance(n, ast.BinOp) and isinstance(n.op, _NUM_ALLOWED_BINOPS):
-                a = _eval(n.left)
-                b = _eval(n.right)
-                if isinstance(n.op, ast.Add):
-                    return a + b
-                if isinstance(n.op, ast.Sub):
-                    return a - b
-                if isinstance(n.op, ast.Mult):
-                    return a * b
-                if isinstance(n.op, ast.Div):
-                    return a / b
-            raise ValueError(f"Disallowed numeric expression for {field}: {value!r}")
-        return float(_eval(node))
-    raise ValueError(f"Unsupported numeric type for {field}: {type(value)}")
+            raise ValueError(f"Only numeric constants allowed in {field}")
+
+        if isinstance(n, ast.UnaryOp):
+            if type(n.op) not in _ALLOWED_UNARYOPS:
+                raise ValueError(f"Unary operator not allowed in {field}")
+            return _ALLOWED_UNARYOPS[type(n.op)](_eval(n.operand))
+
+        if isinstance(n, ast.BinOp):
+            if type(n.op) not in _ALLOWED_BINOPS:
+                raise ValueError(f"Operator not allowed in {field}")
+            left = _eval(n.left)
+            right = _eval(n.right)
+            result = _ALLOWED_BINOPS[type(n.op)](left, right)
+            return result
+
+        raise ValueError(f"Disallowed expression element in {field}: {value!r}")
+
+    result = _eval(node)
+
+    # Reject complex numbers
+    if isinstance(result, complex):
+        raise ValueError(f"Complex numbers not allowed in {field}")
+
+    return float(result)
 
 
 def parse_numeric_optional(value: Any, *, field: str = "") -> Optional[float]:
