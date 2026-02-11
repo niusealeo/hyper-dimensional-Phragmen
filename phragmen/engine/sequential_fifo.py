@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Set, Tuple
 import math
 
-from .types import EPS, Group
+from ..types import EPS, Group
 
 
 ROUND_FIELDS = [
