@@ -8,6 +8,7 @@ import os
 
 from . import io as io_mod
 from .engine import (
+    run_fifo_ordering_general_alpha,
     ROUND_FIELDS, QUOTA_FIELDS, PROJ_FIELDS,
     build_supporters, choose_candidate_for_round,
     compute_projection_delta_for_chosen,
@@ -131,6 +132,7 @@ def run_sequential(
 
     groups = base_groups + mega_groups + party_groups + electorate_groups
     weights = [g.weight for g in groups]
+    mega_indices = [i for i, g in enumerate(groups) if g.kind == "mega"]
     supporters = build_supporters(groups, candidates)
 
     gid_to_index = {g.gid: i for i, g in enumerate(groups)}
@@ -198,12 +200,25 @@ def run_sequential(
                 pool_to_use = iter_pool
                 pool_source = "iter"
 
+            weights_for_round = weights
+            if profile.key == "324" and norm_ctx is not None and mega_indices:
+                n_norm = float(norm_ctx.get("n", 0.0))
+                if n_norm > 0:
+                    z = sum(weights[i] for i in mega_indices if active_mask[i])
+                    if z > (n_norm / 3.0) + 1e-18 and z > 0:
+                        mega_mult = n_norm / (3.0 * z)
+                        eff = list(weights)
+                        for i in mega_indices:
+                            if active_mask[i]:
+                                eff[i] = weights[i] * mega_mult
+                        weights_for_round = eff
+
             chosen, dt, have, rate, allow_used = choose_candidate_for_round(
                 remaining=remaining,
                 balances=None if spend_mode == "fifo_time_priority" else balances,
                 t_now=t_now if spend_mode == "fifo_time_priority" else None,
                 t_start=t_start if spend_mode == "fifo_time_priority" else None,
-                weights=weights,
+                weights=weights_for_round,
                 supporters=supporters,
                 active_mask=active_mask,
                 party_lists=party_lists,
@@ -232,7 +247,7 @@ def run_sequential(
                     groups=groups,
                     t_now=t_now,
                     t_start=t_start,
-                    weights=weights,
+                    weights=weights_for_round,
                     supporters=supporters,
                     active_mask=active_mask,
                     spend_tiers=spend_tiers,
@@ -442,7 +457,30 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     seats = int(data["seats"])
 
+    # Global totals (wglobal1..4) for uniform quota share calculations.
+    globals_ctx = io_mod.compute_global_totals(data)
+    wglobal1 = globals_ctx["wglobal1"]
+    wglobal2 = globals_ctx["wglobal2"]
+    wglobal3 = globals_ctx["wglobal3"]
+    wglobal4 = globals_ctx["wglobal4"]
+    wglobal5 = globals_ctx["wglobal5"]
+
+    base_electorate_info = io_mod.compute_base_electorate_info(data.get("ballots", []))
+    partyrock_electorate_info = io_mod.compute_partyrock_electorate_info(data.get("partyrock_ballots", []))
+
+    # MegaRock sums (parsing-only; used to compute mega share2 = max(w1, sum(wmr))).
+    megarock_abs_by_mega = io_mod.compute_megarock_abs_sums(data.get("megarock_ballots", []) or [])
+
     base_groups = io_mod.canonicalize_base_ballots(data.get("ballots", []), profile=profile)
+
+    # Profile 12/324: constant normalisation multipliers computed from input totals.
+    norm_ctx = None  # type: Optional[dict]
+    if profile.key in ("12", "324"):
+        x, y, n_norm = io_mod.compute_profile_12_324_totals(data)
+        voter_mult, party_mult = io_mod.compute_profile_12_324_multipliers(profile.key, x=x, y=y, n=n_norm)
+        base_groups = io_mod.apply_constant_multiplier(base_groups, voter_mult, label="voter")
+        norm_ctx = {"x": x, "y": y, "n": n_norm, "voter_mult": voter_mult, "party_mult": party_mult}
+
     total_voter_ballots = io_mod.total_normal_ballots_weight(base_groups)
 
     candidate_meta = io_mod.parse_candidate_meta(data.get("candidate_meta") or {})
@@ -451,20 +489,42 @@ def main(argv: Optional[List[str]] = None) -> None:
     candidates |= io_mod.candidates_from_groups(base_groups)
     candidates |= io_mod.extract_candidates_from_defs(data.get("party_ballots", []))
     candidates |= io_mod.extract_candidates_from_defs(data.get("electorate_ballots", []))
+    # PartyRock ballots: parse approvals for candidate discovery (not yet used by profiles).
+    for _pr in data.get("partyrock_ballots", []) or []:
+        if isinstance(_pr, dict):
+            for _c in (_pr.get("approvals") or []):
+                if str(_c).strip() != "":
+                    candidates.add(str(_c))
+    # MegaRock ballots: parse approvals for candidate discovery (not yet used by profiles).
+    for _mr in data.get("megarock_ballots", []) or []:
+        if isinstance(_mr, dict):
+            for _c in (_mr.get("approvals") or []):
+                if str(_c).strip() != "":
+                    candidates.add(str(_c))
     candidates |= io_mod.extract_candidates_from_defs(data.get("mega_ballots", []))
 
     prefix_allow, ban = io_mod.parse_prefix_intervention(data)
 
+    partyrock_abs_by_party = io_mod.compute_partyrock_party_abs_sums(data.get("partyrock_ballots", []) or [])
     party_groups, party_lists, party_meta, party_cands = io_mod.parse_party_ballots(
         data.get("party_ballots", []),
-        total_voter_ballots=total_voter_ballots,
+        wglobal2=wglobal2,
+        wglobal4=wglobal4,
+        partyrock_abs_by_party=partyrock_abs_by_party,
+        partyrock_norm_sum_by_party=None,
         profile=profile,
     )
     candidates |= party_cands
 
+    if norm_ctx is not None and profile.key in ("12", "324"):
+        party_groups = io_mod.apply_constant_multiplier(party_groups, norm_ctx["party_mult"], label="party")
+        party_meta = io_mod.apply_constant_multiplier(party_meta, norm_ctx["party_mult"], label="party")
+
     mega_groups, mega_meta = io_mod.parse_mega_ballots(
         data.get("mega_ballots", []),
-        total_voter_ballots=total_voter_ballots,
+        wglobal1=wglobal1,
+        wglobal4=wglobal4,
+        megarock_abs_by_mega=megarock_abs_by_mega,
         candidate_set=candidates,
         candidate_meta=candidate_meta,
         profile=profile,
@@ -472,10 +532,217 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     electorate_groups, electorate_meta = io_mod.parse_electorate_ballots(
         data.get("electorate_ballots", []),
-        total_voter_ballots=total_voter_ballots,
+        wglobal2=wglobal2,
+        wglobal4=wglobal4,
         candidate_set=candidates,
         profile=profile,
+        base_electorate_info=base_electorate_info,
+        partyrock_electorate_info=partyrock_electorate_info,
     )
+
+    # Parse PartyRock ballots (not yet included in the engine group set).
+    partyrock_groups, partyrock_meta = io_mod.parse_partyrock_ballots(
+        data.get("partyrock_ballots", []),
+        electorate_groups=electorate_groups,
+        candidate_set=candidates,
+    )
+
+    # Parse MegaRock ballots (parsing-only; not yet included in the engine group set).
+    megarock_groups, megarock_meta = io_mod.parse_megarock_ballots(
+        data.get("megarock_ballots", []) or [],
+        electorate_groups=electorate_groups,
+        wglobal1=wglobal1,
+        wglobal2=wglobal2,
+        candidate_set=candidates,
+    )
+
+    # PartyRock -> Party derived attributes (parsing only; does not change allocation semantics).
+    # - Auto-create party ballots referenced by PartyRock ballots when missing.
+    # - Attach a calculated attribute to party ballots: sum of PartyRock electorate-normalized weights.
+    partyrock_party_sums = io_mod.compute_partyrock_party_sums(partyrock_groups)
+
+    # Index existing parties.
+    _party_by_gid = {g.gid: g for g in party_groups}
+    for pid, sum_norm in sorted(partyrock_party_sums.items(), key=lambda kv: kv[0]):
+        if pid in _party_by_gid:
+            # Update meta for existing party groups (and meta duplicates).
+            for _lst in (party_groups, party_meta):
+                for idx, g in enumerate(list(_lst)):
+                    if g.gid != pid:
+                        continue
+                    _lst[idx] = io_mod._clone_group_with_weight(
+                        g,
+                        g.weight,
+                        meta_update={"partyrock_sum_norm_weight": float(sum_norm)},
+                    )
+        else:
+            # Auto-create a placeholder party ballot with weight 0 and no approvals.
+            auto = Group(
+                gid=str(pid),
+                kind="party",
+                approvals=tuple(),
+                weight=0.0,
+                quota_floor=None,
+                population=None,
+                abs_weight=None,
+                share=None,
+                meta={"source": "party_ballots_auto", "partyrock_sum_norm_weight": float(sum_norm)},
+            )
+            party_groups.append(auto)
+            party_meta.append(auto)
+            if str(pid) not in party_lists:
+                party_lists[str(pid)] = []
+
+
+# Party list extension from PartyRock ballots (parsing-only, used for tie-breaking order maps).
+# For each party:
+#   - extra candidates = candidates appearing in PartyRock approvals for that party but not already in the party list
+#   - run a mini FIFO sequential Phragmén election (general_alpha-style) over the extra candidates
+#     using:
+#       * base ballots: all base ballots (raw) whose approvals include any extra candidate (restricted to extra set)
+#       * party ballots (quota): PartyRock ballots associated with the party (restricted to extra set)
+#     Mini population = max(sum(abs base weights), sum(abs partyrock weights))
+#     PartyRock quota shares use a 1/3 scaling factor in the mini election (relative to mini population).
+#
+# The resulting winner order is appended to the existing party list, and party quota approvals
+# are expanded to include the appended candidates (so tie-break maps and quota coverage agree).
+partyrock_by_party = {}
+for g in partyrock_groups:
+    pid = str((g.meta or {}).get("party") or "party_unknown")
+    partyrock_by_party.setdefault(pid, []).append(g)
+
+# Raw base ballots are used (pre-profile scaling) for the mini election.
+raw_base_ballots = data.get("ballots", []) or []
+
+for pid, pr_groups in sorted(partyrock_by_party.items(), key=lambda kv: kv[0]):
+    existing_list = list(party_lists.get(pid, []))
+    existing_set = set(str(x) for x in existing_list)
+
+    # Candidate universe for this extension (PartyRock candidates not already in party list).
+    pr_cand_set = set()
+    for g in pr_groups:
+        pr_cand_set.update(g.approvals)
+    extra = [c for c in sorted(pr_cand_set) if c not in existing_set]
+    if not extra:
+        continue
+
+    extra_set = set(extra)
+
+    # Build mini base groups: raw ballots restricted to extra candidates.
+    base_agg = {}
+    base_sum = 0.0
+    for b in raw_base_ballots:
+        if not isinstance(b, dict):
+            continue
+        apps = [str(x) for x in (b.get("approvals") or [])]
+        apps = [a for a in apps if a in extra_set]
+        if not apps:
+            continue
+        try:
+            w = float(b.get("weight", 1.0))
+        except Exception:
+            w = 0.0
+        if w <= 0:
+            continue
+        key = tuple(sorted(set(apps)))
+        base_agg[key] = base_agg.get(key, 0.0) + w
+        base_sum += w
+
+    mini_base_groups = [
+        Group(
+            gid=f"mini_base_{pid}_{i}",
+            kind="base",
+            approvals=apps,
+            weight=float(w),
+            abs_weight=float(w),
+            meta={"source": "mini_party_list_extension", "party": pid},
+        )
+        for i, (apps, w) in enumerate(base_agg.items())
+    ]
+
+    # Build mini quota groups from PartyRock ballots restricted to extra candidates.
+    pr_sum_abs = 0.0
+    mini_quota_groups = []
+    for i, g in enumerate(pr_groups):
+        apps = tuple(sorted(set([c for c in g.approvals if c in extra_set])))
+        if not apps:
+            continue
+        abs_w = float(g.abs_weight or 0.0)
+        if abs_w <= 0:
+            continue
+        pr_sum_abs += abs_w
+        mini_quota_groups.append((i, apps, abs_w))
+
+    mini_pop = float(max(base_sum, pr_sum_abs, 0.0))
+    if mini_pop <= 0:
+        # Fallback: append deterministically if no weight info.
+        ordered_extra = list(extra)
+    else:
+        quota_groups = []
+        for i, apps, abs_w in mini_quota_groups:
+            # Canonical quota mapping for the mini election:
+            #   share = wr / N
+            #   quota_floor = min((2/3)*share, 1/3)
+            #   rel_weight = N * quota_floor
+            share = (abs_w / mini_pop) if mini_pop > 0 else 0.0
+            qf = io_mod.quota_floor_from_share(share)
+            rel_w = io_mod.normalize_rel_weight_from_share(share, mini_pop)
+            quota_groups.append(
+                Group(
+                    gid=f"mini_pr_{pid}_{i}",
+                    kind="party",
+                    approvals=apps,
+                    weight=float(rel_w),
+                    quota_floor=float(qf),
+                    population=float(mini_pop),
+                    abs_weight=float(abs_w),
+                    share=float(share),
+                    meta={"source": "mini_party_list_extension", "party": pid, "mini_pop": mini_pop},
+                )
+            )
+
+        # Run mini election to obtain ordering.
+        ordered_extra = run_fifo_ordering_general_alpha(
+            candidates=extra,
+            base_groups=mini_base_groups,
+            quota_groups=quota_groups,
+            party_lists={},  # no pre-existing order for extras
+            dt0_tie_rule="party_then_name",
+            spend_tiers_str="base>party",
+            tier_within_mode="combined_fifo",
+        )
+
+        # Safety: ensure all extras appear (append any missing deterministically).
+        missing = [c for c in extra if c not in set(ordered_extra)]
+        if missing:
+            ordered_extra.extend(sorted(missing))
+
+    # Append to party list, preserving original order.
+    party_lists[pid] = existing_list + ordered_extra
+
+    # Expand party quota approvals set to include appended candidates.
+    extra_tuple = tuple(sorted(set(ordered_extra)))
+    if extra_tuple:
+        for _lst in (party_groups, party_meta):
+            for idx, g in enumerate(list(_lst)):
+                if g.gid != pid:
+                    continue
+                new_apps = tuple(sorted(set(g.approvals) | set(extra_tuple)))
+                _lst[idx] = io_mod._clone_group_with_weight(
+                    Group(
+                        gid=g.gid,
+                        kind=g.kind,
+                        approvals=new_apps,
+                        weight=g.weight,
+                        quota_floor=g.quota_floor,
+                        population=g.population,
+                        abs_weight=g.abs_weight,
+                        share=g.share,
+                        meta=g.meta,
+                    ),
+                    g.weight,
+                    meta_update={"party_list_extended": True, "party_list_extension_size": len(ordered_extra)},
+                )
 
     candidates_list = sorted(candidates)
     os.makedirs(args.outdir, exist_ok=True)

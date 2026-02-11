@@ -419,3 +419,92 @@ def spend_winner_fifo_time_priority_tiers(
                 continue
             spent = _fifo_spend_exact_amount(t_now, t_start, weights, idxs_all, need)
             need -= spent
+
+
+
+def run_fifo_ordering_general_alpha(
+    *,
+    candidates: List[str],
+    base_groups: List[Group],
+    quota_groups: List[Group],
+    party_lists: Optional[Dict[str, List[str]]] = None,
+    dt0_tie_rule: str = "party_then_name",
+    spend_tiers_str: str = "base>party",
+    tier_within_mode: str = "combined_fifo",
+) -> List[str]:
+    """Run a minimal sequential Phragmén election to produce an ordering over `candidates`.
+
+    This is intended for internal tie-breaking list construction (e.g., party list extensions).
+    It runs with FIFO time-priority spending and quota activation (current_round-based).
+
+    Returns the winner ordering (length <= len(candidates)).
+    """
+    party_lists = party_lists or {}
+    spend_tiers = parse_spend_tiers(spend_tiers_str)
+
+    # Compose group list; base groups first, then quota groups.
+    groups: List[Group] = list(base_groups) + list(quota_groups)
+    weights: List[float] = [float(g.weight) for g in groups]
+    gid_to_index = {g.gid: i for i, g in enumerate(groups)}
+
+    # FIFO time state
+    t_now: float = 0.0
+    t_start: List[float] = [0.0] * len(groups)
+
+    winners: List[str] = []
+    winners_set: Set[str] = set()
+    cand_list = list(dict.fromkeys([str(c) for c in candidates if str(c).strip() != ""]))
+    cand_set = set(cand_list)
+
+    # Supporters index for this candidate universe
+    supporters = build_supporters(groups, cand_list)
+
+    # Quota activation only applies to quota_groups
+    for r in range(1, len(cand_list) + 1):
+        remaining = [c for c in cand_list if c not in winners_set]
+        if not remaining:
+            break
+
+        quota_info = compute_quota_active_info(quota_groups, winners, r)
+
+        active_mask = [True] * len(groups)
+        for g in quota_groups:
+            active_mask[gid_to_index[g.gid]] = bool(quota_info[g.gid][0])
+
+        chosen, dt, have, rate, _allow_used = choose_candidate_for_round(
+            remaining=remaining,
+            balances=None,
+            t_now=t_now,
+            t_start=t_start,
+            weights=weights,
+            supporters=supporters,
+            active_mask=active_mask,
+            party_lists=party_lists,
+            allow_only_pool=None,
+            dt0_tie_rule=dt0_tie_rule,
+            spend_mode="fifo_time_priority",
+        )
+
+        # Advance time (FIFO)
+        dt = float(dt)
+        if dt < 0:
+            dt = 0.0
+        t_now += dt
+
+        spend_winner_fifo_time_priority_tiers(
+            cand=chosen,
+            groups=groups,
+            t_now=t_now,
+            t_start=t_start,
+            weights=weights,
+            supporters=supporters,
+            active_mask=active_mask,
+            spend_tiers=spend_tiers,
+            tier_within_mode=tier_within_mode,
+        )
+
+        winners.append(chosen)
+        winners_set.add(chosen)
+
+    # Ensure returned list only includes candidates from the original universe.
+    return [w for w in winners if w in cand_set]
