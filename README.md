@@ -169,7 +169,8 @@ Derived:
 ### `general_alpha`
 
 Baseline FIFO sequential Phragmén with quota‑floor activation and the default spend tiers.
-(should credibly work ok for basic inquisitive experimental purposes, or low key entry level home administration revovation projects)
+
+(Should credibly work ok for basic inquisitive experimental purposes, or low key entry level home administration renovation projects)
 
 ### `12` (currently under construction, yet to finish)
 
