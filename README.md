@@ -254,7 +254,7 @@ python -m phragmen.cli profiles
 
 ## JSON schema example
 
-This is an illustrative example (minimal fields shown):
+This is an illustrative example (minimal fields shown): (input quota-floor ballot weights, shares, and quota_floors greater than quota_floor = 1/3 are always reduced to 1/3 in the algorithm)
 
 ```json
 {
@@ -289,7 +289,9 @@ This is an illustrative example (minimal fields shown):
   ],
 
   "mega_ballots": [
-    {"id": "M01", "weight": 2000000, "candidates": ["A", "B", "C"]}
+    {"id": "M01", "weight": 2000000, "candidates": ["A", "B", "C"]},
+    {"id": "M02", "share": 0.6},
+    {"id": "M03", "quota_floor": "1/2"}
   ],
 
   "partyrock_ballots": [
