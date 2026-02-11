@@ -1,3 +1,5 @@
+See repository's `flagship_prototype_general_alpha` branch for previous version before recent algorithm changing updates.
+
 # Phragmén FIFO (Sequential) — quota floors, FIFO spend, audit
 
 This repository implements an auditable **sequential Phragmén** engine for experiments with:
