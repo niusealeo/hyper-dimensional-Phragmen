@@ -1,155 +1,290 @@
-# Sequential Phragmén on Crack — FIFO Time-Priority Edition
+# Phragmén FIFO (Sequential) — quota floors, FIFO spend, audit
 
-This repository implements a generalized, auditable sequential Phragmén engine with:
+This repository implements an auditable **sequential Phragmén** engine for experiments with:
 
-- **FIFO (time-priority) credit spending** using a cutoff time **τ**
-- **soft quota floors** for `electorate`, `party`, and `mega` groups
-- quota groups that are **either active (unsatisfied)** or **dormant (satisfied)**  
-  - dormant groups **accumulate reserve** but **do not contribute** to selection
-- intervention-compatible sequencing (prefix allow-only, iterative allow-only, bans)
-- **multi-pass A/B iteration** with **cycle/twin signature detection**
-- **franchise (projection) accounting** for electorate inclusion / participation analysis
-- auditable CSV outputs for every round
+- **FIFO (time‑priority) credit spending** (cutoff time **τ**).
+- **Quota‑floor ballots** (`electorate`, `party`, `mega`) that can be **active (unsatisfied)** or **dormant (satisfied)** each round.
+- **Franchise / projection accounting** derived from base ballots (how much of the base franchise is “used” as winners are chosen).
+- Parsing support for additional local ballot types (`partyrock`, `megarock`) that are **not yet fed into the main allocation** (parsing + audit only).
+
+The code is intentionally bookkeeping‑heavy: most derived values are written to audit CSVs.
 
 ---
 
-## Credit model (FIFO)
+## Core concepts
 
-Each group *g* earns credit continuously at rate `w_g`.
+### Base ballots
 
-FIFO mode stores, per group:
+Base ballots are approval ballots (optionally aggregated). They are the “normal” voters in the sequential run.
 
-- `t_start[g]`: start time of *currently unspent* credit
-- `t_now`: global time
+### Quota‑floor ballots
 
-Unspent credit at time `t_now`:
+Quota ballots represent **minimum quota floors**, not continuously‑available support balances.
 
-```
-B_g(t_now) = w_g × max(0, t_now − t_start[g])
-```
+At sequential round `r`:
 
----
+- `required = ceil(quota_floor * r)`
+- the quota ballot is **active** iff `winners_in_set < required`
 
-## FIFO spend mode and cutoff τ
+Active quota ballots can contribute/spend under the configured spending tiers.
+Dormant quota ballots accumulate reserve in FIFO time, but are not counted for selection pressure.
 
-When a candidate is elected, spend exactly **1.0 seat value** using **oldest credit first**.
+### Canonical share → quota_floor mapping
 
-Given paying groups `S`, find a cutoff time `τ ≤ t_now` such that:
+For any quota ballot we first compute a **share** `share = wr / N` (where `wr` is an absolute / derived weight and `N` is the arena population).
 
-```
-Σ_g∈S w_g × max(0, τ − t_start[g]) = 1
-```
+Then:
 
-Then advance each paying group’s `t_start[g]` up to `τ` (or to `t_now` if fully drained).
+- `quota_floor = min((2/3) * share, 1/3)`
+- `rel_weight = N * quota_floor`
 
-This preserves “overshoot leftovers” automatically: credit earned after `τ` remains intact.
+This is the one definition used for `mega`, `party`, `electorate`, and in the PartyRock mini‑elections.
 
 ---
 
-## Soft quota floors: active vs dormant
+## Global election attributes
 
-Quota groups (`electorate`, `party`, `mega`) are **minimum quota floors**.
+At JSON input (top‑level), provide:
 
-They behave as **reserve racers**:
+- `total_population`  (wglobal1)
+- `total_enrollment`  (wglobal2)
+- `total_turnout`     (wglobal3)
 
-- **Dormant (satisfied)**: they keep accumulating reserve, but do not affect dt/have.
-- **Active (unsatisfied)**: they contribute to dt/have and can be spent.
+Derived:
 
-**Quota activation is computed strictly at the current sequential round `r`**
-(no projection look-ahead):
+- `wglobal4 = max(wglobal3, sum(party wp1), sum(partyrock wpr1), sum(base wr))`
+- `wglobal5 = max(wglobal2, sum(electorate we1))`
 
-```
-required = ceil(quota_floor × r)
-active iff winners_in_set < required
-```
+Notes:
 
----
-
-## Tiered priority spending
-
-Spend is performed by priority tiers across kinds.
-
-Default:
-
-```
-base > electorate > party > mega
-```
-
-You can group kinds in a tier:
-
-```
-base > party > electorate,mega
-```
-
-Within a tier:
-
-- `combined_fifo` (default): pool kinds, compute one τ
-- `separate_by_kind`: FIFO spend kind-by-kind in listed order
+- If a global is missing/invalid, the parser applies fallbacks (see `compute_global_totals`).
+- The **arena N** used when converting to `rel_weight` is:
+  - `N = wglobal4` for global quota ballots (`mega`, `party`, `electorate`)
+  - `N = we3` for local quota ballots (`partyrock`, `megarock`)
 
 ---
 
-## Franchise participation (projection)
+## Ballot kinds and derived quantities
 
-Projection measures electorate inclusion:
+### Mega ballots (global quota)
 
-- Only `base` (voter) groups contribute.
-- Each base group is counted at most once.
-- Per winner:
-  - `delta_voter_ballots_used`
-  - `delta_projection = delta / total_voter_ballots`
-  - `total_projection` cumulative
+Input per mega:
 
-Projection drives convergence signatures and the “full chamber” rule.
+- `id`
+- `weight` (w1)
+- `candidates` (approvals)
+
+Derived:
+
+- `w2 = max(w1, sum(megarock wmr linked to this mega))`
+- `share1 = w1 / wglobal1`
+- `share2 = w2 / wglobal1`
+- `share_used = max(share1, share2)`
+- `quota_floor = min((2/3)*share_used, 1/3)`
+- `rel_weight = wglobal4 * quota_floor`
+
+### Electorate ballots (global quota)
+
+Input per electorate:
+
+- `id`
+- `weight` (we1 = enrolled population)
+- `turnout` (we2 = electorate turnout)
+- `candidates` (may be extended by registered base/PartyRock ballots)
+
+Derived:
+
+- `we3 = max(we2, sum(base wr in electorate), sum(PartyRock wpr1 in electorate))`
+- `share1 = we2 / wglobal5`
+- `share2 = we3 / wglobal4`
+- `share_used = max(share1, share2)`
+- `quota_floor = min((2/3)*share_used, 1/3)`
+- `rel_weight = wglobal4 * quota_floor`
+
+Additional parsing‑time counters:
+
+- `counted_base_ballots`, `counted_base_records`
+- `counted_partyrock_abs_weight`, `counted_partyrock_records`, `counted_partyrock_ballots`
+
+Auto‑creation:
+
+- If base ballots or PartyRock ballots reference a missing electorate, a new electorate ballot is auto‑created.
+- Auto‑created electorates are populated with candidates discovered from their associated ballots.
+
+### Party ballots (global quota)
+
+Input per party:
+
+- `id`
+- `weight` (wp1)
+- `candidates` (ordered party list)
+
+Derived:
+
+- `wp2 = max(wp1, sum(PartyRock wpr1 linked to this party))`
+- `wp3 = sum(PartyRock electorate‑normalised weights wpr2 linked to this party)`
+- `share1 = wp2 / wglobal4`
+- `share2 = wp3 / wglobal5`
+- `share_used = max(share1, share2)`
+- `quota_floor = min((2/3)*share_used, 1/3)`
+- `rel_weight = wglobal4 * quota_floor`
+
+Auto‑creation:
+
+- If a PartyRock ballot references a missing party ballot, a placeholder party ballot is auto‑created.
+
+### PartyRock ballots (local quota; parsing/audit only)
+
+Input per PartyRock:
+
+- `weight` (wpr1)
+- `approvals` (ordered; used later for tie breaking / list extension)
+- `electorate` reference
+- `party` reference
+
+Derived per associated electorate:
+
+- `wpr2 = wpr1 * we1 / we3`
+- `share1 = wpr1 / we2` (for future local quota use)
+- Arena N for `rel_weight` conversion would be `we3`.
+
+### MegaRock ballots (local quota; parsing/audit only)
+
+Input per MegaRock:
+
+- `weight` (wmr)
+- `approvals`
+- `electorate` reference
+- `mega` reference
+
+Derived:
+
+- `share1 = wmr / (we1 * wglobal1 / wglobal5)`
+- Arena N for `rel_weight` conversion is `we3`.
 
 ---
 
-## Multi-pass A/B iteration + cycle detection
+## Profiles
 
-Pass 1: normal sequential run.
+### `general_alpha`
 
-For pass ≥ 2:
+Baseline FIFO sequential Phragmén with quota‑floor activation and the default spend tiers.
 
-- **A**: allow-only winners covering projection interval **[1/9, 5/9]** from previous pass
-- **B**: allow-only the entire A list (in order), then run until projection **> 5/9 (strict)**
+### `12`
 
-Signature = “Part-B prefix of winners until projection > 5/9 (strict)”.
+Adds constant (election‑wide) normalisation multipliers computed from absolute totals:
 
-All signatures are stored; any repeat signature is a **twin / cycle**.
-Cycle length is detected as the difference in iteration indices.
+- `x = sum(base ballot weights)`
+- `y = sum(party ballot weights)`
+- `n = input (n/total_ballots) or defaults to max(x, y)`
 
----
+Multipliers:
 
-## Full chamber completion rule
+- Base voter multiplier: `(n + (2x - y)) / (3n)`
+- Party multiplier: `(2n - (2x - y)) / (3n)`
 
-Full chamber size is:
+### `324`
 
-```
-max(
-  input seats,
-  first round where projection > 2/3 (strict)
-)
-```
+Same as `12`, with different constants:
 
-Capped by the number of candidates.
+- Base voter multiplier: `(n + (2x - y))*2 / (9n)`
+- Party multiplier: `(2n - (2x - y))*2 / (9n)`
 
----
+And dynamic mega scaling per round (only for active mega quota groups):
 
-## Outputs
-
-Each pass writes:
-
-- `*_rounds.csv` — dt/have/time + projection + quota activation + intervention usage
-- `*_quota.csv` — quota group active flags + reserve balances
-- `*_projection.csv` — projection accounting per round
-- optional `--quota_meta_csv` — normalized population/weight/share/quota_floor
+- `z = sum(active mega rel_weights)`
+- if `z <= n/3`: mega multiplier = `1`
+- else: mega multiplier = `n / (3z)`
 
 ---
 
-## Run
+## Party list extension from PartyRock ballots
+
+If PartyRock ballots contain candidates not present in the party’s ordered list, those candidates are appended.
+
+To generate an order for the appended segment, the tool runs a **mini `general_alpha` FIFO sequential election** for each party:
+
+- **Candidates:** the party’s missing candidates.
+- **Mini base ballots:** all base ballots whose approvals include any of those candidates (restricted to that candidate set).
+- **Mini quota ballots:** the party’s PartyRock ballots (restricted to that candidate set).
+- `mini_pop = max(sum(mini base abs), sum(mini PartyRock abs))`
+- Mini quota mapping uses the same share→quota_floor mapping with `N = mini_pop`.
+
+The resulting winner order is appended to the party list.
+
+---
+
+## Audit outputs
+
+The CLI writes audit outputs to the output directory:
+
+- `audit_globals.csv` — globals + (if relevant) profile 12/324 normalisation context.
+- `audit_groups.csv` — one row per parsed group/ballot with meta JSON (includes derived shares, arena N, etc.).
+- `audit_party_lists.csv` — party list ordering (after PartyRock extensions).
+
+The sequential passes also write:
+
+- `passXX_rounds.csv`
+- `passXX_quota.csv`
+- `passXX_projection.csv`
+
+---
+
+## CLI
+
+Run an election:
 
 ```bash
-python -m phragmen.cli election.json --outdir out \
-  --profile general_alpha \
-  --spend_tiers "base>party>electorate,mega" \
-  --tier_within_mode combined_fifo
+python -m phragmen.cli run --input-json path/to/election.json --outdir out --profile general_alpha
 ```
+
+List profiles:
+
+```bash
+python -m phragmen.cli profiles
+```
+
+---
+
+## JSON schema example
+
+This is an illustrative example (minimal fields shown):
+
+```json
+{
+  "seats": 10,
+  "total_population": 5000000,
+  "total_enrollment": 4200000,
+  "total_turnout": 3100000,
+
+  "candidates": ["A", "B", "C"],
+
+  "ballots": [
+    {"weight": 1, "approvals": ["A", "B"], "electorate": "E01"},
+    {"weight": 2, "approvals": ["B"], "electorate": "E02"}
+  ],
+
+  "electorate_ballots": [
+    {"id": "E01", "weight": 100000, "turnout": 70000, "candidates": ["A", "B"]},
+    {"id": "E02", "weight": 120000, "turnout": 80000, "candidates": ["B", "C"]}
+  ],
+
+  "party_ballots": [
+    {"id": "P01", "weight": 500000, "candidates": ["A", "B"]}
+  ],
+
+  "mega_ballots": [
+    {"id": "M01", "weight": 2000000, "candidates": ["A", "B", "C"]}
+  ],
+
+  "partyrock_ballots": [
+    {"weight": 1000, "approvals": ["C"], "electorate": "E02", "party": "P01"}
+  ],
+
+  "megarock_ballots": [
+    {"weight": 200, "approvals": ["A"], "electorate": "E01", "mega": "M01"}
+  ]
+}
+```
+
+MD
