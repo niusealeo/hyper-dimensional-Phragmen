@@ -198,7 +198,7 @@ And dynamic mega scaling per round (only for active mega quota groups):
 - if `z <= n/3`: mega multiplier = `1`
 - else: mega multiplier = `n / (3z)`
 
-### Todo: more profiles, e.g. tiered federal edition
+### Todo: More electoral topology profiles, e.g. tiered federal edition
 
 ---
 
