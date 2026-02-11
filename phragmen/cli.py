@@ -505,13 +505,33 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     prefix_allow, ban = io_mod.parse_prefix_intervention(data)
 
+    electorate_groups, electorate_meta = io_mod.parse_electorate_ballots(
+        data.get("electorate_ballots", []),
+        wglobal5=wglobal5,
+        wglobal4=wglobal4,
+        candidate_set=candidates,
+        profile=profile,
+        base_electorate_info=base_electorate_info,
+        partyrock_electorate_info=partyrock_electorate_info,
+    )
+
+    # Parse PartyRock ballots (not yet included in the engine group set).
+    partyrock_groups, partyrock_meta = io_mod.parse_partyrock_ballots(
+        data.get("partyrock_ballots", []) or [],
+        electorate_groups=electorate_groups,
+        candidate_set=candidates,
+    )
+
+    partyrock_norm_sum_by_party = io_mod.compute_partyrock_party_sums(partyrock_groups)
+
     partyrock_abs_by_party = io_mod.compute_partyrock_party_abs_sums(data.get("partyrock_ballots", []) or [])
+    
     party_groups, party_lists, party_meta, party_cands = io_mod.parse_party_ballots(
         data.get("party_ballots", []),
-        wglobal2=wglobal2,
+        wglobal5=wglobal5,
         wglobal4=wglobal4,
         partyrock_abs_by_party=partyrock_abs_by_party,
-        partyrock_norm_sum_by_party=None,
+        partyrock_norm_sum_by_party=partyrock_norm_sum_by_party,
         profile=profile,
     )
     candidates |= party_cands
@@ -528,23 +548,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         candidate_set=candidates,
         candidate_meta=candidate_meta,
         profile=profile,
-    )
-
-    electorate_groups, electorate_meta = io_mod.parse_electorate_ballots(
-        data.get("electorate_ballots", []),
-        wglobal2=wglobal2,
-        wglobal4=wglobal4,
-        candidate_set=candidates,
-        profile=profile,
-        base_electorate_info=base_electorate_info,
-        partyrock_electorate_info=partyrock_electorate_info,
-    )
-
-    # Parse PartyRock ballots (not yet included in the engine group set).
-    partyrock_groups, partyrock_meta = io_mod.parse_partyrock_ballots(
-        data.get("partyrock_ballots", []),
-        electorate_groups=electorate_groups,
-        candidate_set=candidates,
     )
 
     # Parse MegaRock ballots (parsing-only; not yet included in the engine group set).
