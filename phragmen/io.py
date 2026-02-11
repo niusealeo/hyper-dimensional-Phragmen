@@ -5,6 +5,7 @@ from collections import defaultdict
 import csv
 import json
 import math
+import ast
 
 from .types import Group, ElectionProfile
 
@@ -42,7 +43,7 @@ def compute_profile_12_324_totals(data: dict) -> Tuple[float, float, float]:
     for b in ballots or []:
         apps = b.get("approvals", [])
         try:
-            w = float(b.get("weight", 1.0))
+            w = float(parse_numeric_optional(b.get("weight", 1.0), field="ballots.weight") or 0.0)
         except Exception:
             w = 0.0
         if w <= 0:
@@ -59,7 +60,7 @@ def compute_profile_12_324_totals(data: dict) -> Tuple[float, float, float]:
             continue
         if d.get("weight") is not None:
             try:
-                w = float(d.get("weight"))
+                w = float(parse_numeric_optional(d.get("weight"), field="ballots.weight") or 0.0)
             except Exception:
                 w = 0.0
             if w > 0:
@@ -134,7 +135,7 @@ def compute_base_electorate_info(ballots: List[dict]) -> Dict[str, dict]:
     for b in ballots or []:
         apps = _canon_approvals(b.get("approvals", []))
         try:
-            w = float(b.get("weight", 1.0))
+            w = float(parse_numeric_optional(b.get("weight", 1.0), field="ballots.weight") or 0.0)
         except Exception:
             w = 0.0
         if w <= 0 or not apps:
@@ -173,7 +174,7 @@ def compute_partyrock_electorate_info(partyrock_defs: List[dict]) -> Dict[str, d
             continue
         apps = _canon_approvals(d.get("approvals", []))
         try:
-            w_abs = float(d.get("weight", 0.0))
+            w_abs = float(parse_numeric_optional(d.get("weight", 0.0), field="partyrock.weight") or 0.0)
         except Exception:
             w_abs = 0.0
         if w_abs <= 0 or not apps:
@@ -210,7 +211,7 @@ def canonicalize_base_ballots(ballots: List[dict], profile: ElectionProfile) -> 
 
     for b in ballots or []:
         apps = _canon_approvals(b.get("approvals", []))
-        w = float(b.get("weight", 1.0))
+        w = float(parse_numeric_optional(b.get("weight", 1.0), field="ballots.weight") or 0.0)
         if w <= 0 or not apps:
             continue
 
@@ -303,6 +304,76 @@ def parse_prefix_intervention(data: dict) -> Tuple[List[str], Set[str]]:
     return allow_list, ban_set
 
 
+
+_NUM_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div)
+_NUM_ALLOWED_UNARYOPS = (ast.UAdd, ast.USub)
+
+def parse_numeric(value: Any, *, field: str = "") -> float:
+    """Parse numeric inputs that may be numbers or string expressions.
+
+    Supported:
+      - int/float
+      - ratio strings like "5/9", "1000/3"
+      - simple arithmetic expressions with + - * / and parentheses (no names, no functions)
+
+    Raises ValueError on invalid expressions.
+    """
+    if value is None:
+        raise ValueError(f"Missing numeric value for {field}" if field else "Missing numeric value")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if s == "":
+            raise ValueError(f"Empty numeric string for {field}" if field else "Empty numeric string")
+        try:
+            return float(s)
+        except Exception:
+            pass
+        try:
+            node = ast.parse(s, mode="eval")
+        except Exception as e:
+            raise ValueError(f"Invalid numeric expression for {field}: {value!r}") from e
+
+        def _eval(n: ast.AST) -> float:
+            if isinstance(n, ast.Expression):
+                return _eval(n.body)
+            if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+                return float(n.value)
+            if isinstance(n, ast.Num):
+                return float(n.n)
+            if isinstance(n, ast.UnaryOp) and isinstance(n.op, _NUM_ALLOWED_UNARYOPS):
+                v = _eval(n.operand)
+                return +v if isinstance(n.op, ast.UAdd) else -v
+            if isinstance(n, ast.BinOp) and isinstance(n.op, _NUM_ALLOWED_BINOPS):
+                a = _eval(n.left)
+                b = _eval(n.right)
+                if isinstance(n.op, ast.Add):
+                    return a + b
+                if isinstance(n.op, ast.Sub):
+                    return a - b
+                if isinstance(n.op, ast.Mult):
+                    return a * b
+                if isinstance(n.op, ast.Div):
+                    return a / b
+            raise ValueError(f"Disallowed numeric expression for {field}: {value!r}")
+        return float(_eval(node))
+    raise ValueError(f"Unsupported numeric type for {field}: {type(value)}")
+
+
+def parse_numeric_optional(value: Any, *, field: str = "") -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip() == "":
+        return None
+    return parse_numeric(value, field=field)
+
+
+def clamp_quota_floor(qf: float) -> float:
+    """Ensure quota floors never exceed 1/3."""
+    return min(float(qf), 1.0 / 3.0)
+
+
 def quota_floor_from_share(share: float) -> float:
     return min((2.0 / 3.0) * share, 1.0 / 3.0)
 
@@ -360,9 +431,10 @@ def compute_global_totals(data: dict) -> dict:
     """
     d = data or {}
 
-    def _f(x) -> float:
+    def _f(x, field: str = "") -> float:
         try:
-            return float(x)
+            v = parse_numeric_optional(x, field=field)
+            return float(v) if v is not None else 0.0
         except Exception:
             return 0.0
 
@@ -373,7 +445,7 @@ def compute_global_totals(data: dict) -> dict:
             continue
         if not b.get("approvals"):
             continue
-        w = _f(b.get("weight", 1.0))
+        w = _f(b.get("weight", 1.0), field="ballots.weight")
         if w > 0:
             base_abs += w
 
@@ -381,7 +453,7 @@ def compute_global_totals(data: dict) -> dict:
     for p in d.get("party_ballots", []) or []:
         if not isinstance(p, dict):
             continue
-        w = _f(p.get("weight", p.get("abs_weight", 0.0)))
+        w = _f(p.get("weight", p.get("abs_weight", 0.0)), field="party_ballots.weight")
         if w > 0:
             party_abs += w
 
@@ -389,7 +461,7 @@ def compute_global_totals(data: dict) -> dict:
     for pr in d.get("partyrock_ballots", []) or []:
         if not isinstance(pr, dict):
             continue
-        w = _f(pr.get("weight", 0.0))
+        w = _f(pr.get("weight", 0.0), field="partyrock_ballots.weight")
         if w > 0:
             partyrock_abs += w
 
@@ -397,21 +469,21 @@ def compute_global_totals(data: dict) -> dict:
     for e in d.get("electorate_ballots", []) or []:
         if not isinstance(e, dict):
             continue
-        w = _f(e.get("weight", e.get("abs_weight", 0.0)))
+        w = _f(e.get("weight", e.get("abs_weight", 0.0)), field="electorate_ballots.weight")
         if w > 0:
             electorate_enroll_abs += w
 
     # Globals.
-    wglobal1 = _f(d.get("total_population", d.get("wglobal1")))
-    wglobal2 = _f(d.get("total_enrollment", d.get("wglobal2")))
-    wglobal3 = _f(d.get("total_turnout", d.get("wglobal3")))
+    wglobal1 = _f(d.get("total_population", d.get("wglobal1")), field="total_population")
+    wglobal2 = _f(d.get("total_enrollment", d.get("wglobal2")), field="total_enrollment")
+    wglobal3 = _f(d.get("total_turnout", d.get("wglobal3")), field="total_turnout")
 
     if wglobal3 <= 0:
         wglobal3 = base_abs
     if wglobal2 <= 0:
         wglobal2 = electorate_enroll_abs
     if wglobal1 <= 0:
-        wglobal1 = wglobal2 if wglobal5 > 0 else max(wglobal3, 0.0)
+        wglobal1 = wglobal2 if wglobal2 > 0 else max(wglobal3, 0.0)
 
     wglobal4 = max(wglobal3, party_abs, partyrock_abs, base_abs)
     wglobal5 = max(wglobal2, electorate_enroll_abs)
@@ -546,15 +618,18 @@ def parse_party_ballots(
         #   share_used = max(share1, share2)
         #   rel_weight = N_used * quota_floor(share_used)
         # Legacy support: if explicit population/quota_floor present, respect it.
-        population = d.get("population")
-        abs_weight = d.get("weight")
-        qf = d.get("quota_floor")
+        population = parse_numeric_optional(d.get("population"), field="party.population")
+        abs_weight = parse_numeric_optional(d.get("weight", d.get("abs_weight")), field="party.weight")
+        share_in = parse_numeric_optional(d.get("share"), field="party.share")
+        qf = parse_numeric_optional(d.get("quota_floor"), field="party.quota_floor")
+        qf = clamp_quota_floor(qf) if qf is not None else None
 
         share = None
         rel_w = 0.0
         meta_extra: Dict[str, Any] = {}
 
-        if (population is None and qf is None) and abs_weight is not None and (wglobal5 > 0 or wglobal4 > 0):
+        # Priority: weight -> share -> quota_floor
+        if abs_weight is not None and (wglobal5 > 0 or wglobal4 > 0):
             wp1 = float(abs_weight)
             pr_abs = float((partyrock_abs_by_party or {}).get(gid, 0.0))
             wp2 = max(wp1, pr_abs)
@@ -564,26 +639,31 @@ def parse_party_ballots(
             share_used = max(share1, share2)
             share = share_used
             qf = quota_floor_from_share(share_used)
-            # Global quota ballots use arena N = wglobal4 for rel_weight conversion.
             rel_w = normalize_rel_weight_from_share(share_used, wglobal4)
             meta_extra.update({
-                "wp1": wp1,
-                "wp2": wp2,
-                "wp3": wp3,
-                "share1": share1,
-                "share2": share2,
-                "share_used": share_used,
-                "N_arena": float(wglobal4),
+        "wp1": wp1,
+        "wp2": wp2,
+        "wp3": wp3,
+        "share1": share1,
+        "share2": share2,
+        "share_used": share_used,
+        "N_arena": float(wglobal4),
             })
             population = float(wglobal4)
-        elif population is not None and abs_weight is not None:
-            share = float(abs_weight) / float(population) if float(population) > 0 else 0.0
-            if qf is None:
-                qf = quota_floor_from_share(share)
-            rel_w = normalize_rel_weight_from_share(share, float(population))
+        elif abs_weight is not None and population is not None:
+            denom = float(population)
+            share = float(abs_weight) / denom if denom > 0 else 0.0
+            qf = quota_floor_from_share(share)
+            rel_w = normalize_rel_weight_from_share(share, denom)
+        elif share_in is not None:
+            share = float(share_in)
+            qf = quota_floor_from_share(share)
+            rel_w = normalize_rel_weight_from_share(share, wglobal4)
+            population = float(wglobal4)
         elif qf is not None:
             share = share_from_quota_floor(float(qf))
-            rel_w = normalize_rel_weight_from_share(share, wglobal4 if wglobal4 > 0 else float(population or 0.0))
+            rel_w = float(wglobal4) * float(qf)
+            population = float(wglobal4)
         else:
             rel_w = float(d.get("rel_weight", 0.0))
 
@@ -644,15 +724,18 @@ def parse_mega_ballots(
         #   share_used = max(share1, share2)
         #   rel_weight = wglobal1 * quota_floor(share_used)
         # Legacy support: if explicit population/quota_floor present, respect it.
-        population = d.get("population")
-        abs_weight = d.get("weight")
-        qf = d.get("quota_floor")
+        population = parse_numeric_optional(d.get("population"), field="mega.population")
+        abs_weight = parse_numeric_optional(d.get("weight", d.get("abs_weight")), field="mega.weight")
+        share_in = parse_numeric_optional(d.get("share"), field="mega.share")
+        qf = parse_numeric_optional(d.get("quota_floor"), field="mega.quota_floor")
+        qf = clamp_quota_floor(qf) if qf is not None else None
 
         share = None
         rel_w = 0.0
         meta_extra: Dict[str, Any] = {}
 
-        if (population is None and qf is None) and abs_weight is not None and wglobal1 > 0:
+        # Priority: weight -> share -> quota_floor
+        if abs_weight is not None and wglobal1 > 0:
             w1 = float(abs_weight)
             wmr_sum = float((megarock_abs_by_mega or {}).get(gid, 0.0))
             w2 = max(w1, wmr_sum)
@@ -661,25 +744,31 @@ def parse_mega_ballots(
             share_used = max(share1, share2)
             share = share_used
             qf = quota_floor_from_share(share_used)
-            # Global quota ballots use arena N = wglobal4 for rel_weight conversion.
             rel_w = normalize_rel_weight_from_share(share_used, wglobal4)
             meta_extra.update({
-                "w1": w1,
-                "w2": w2,
-                "share1": share1,
-                "share2": share2,
-                "share_used": share_used,
-                "N_arena": float(wglobal4),
+        "w1": w1,
+        "w2": w2,
+        "share1": share1,
+        "share2": share2,
+        "share_used": share_used,
+        "N_arena": float(wglobal4),
             })
             population = float(wglobal4)
-        elif population is not None and abs_weight is not None:
-            share = float(abs_weight) / float(population) if float(population) > 0 else 0.0
-            if qf is None:
-                qf = quota_floor_from_share(share)
-            rel_w = normalize_rel_weight_from_share(share, float(population))
+        elif abs_weight is not None and population is not None:
+            denom = float(population)
+            share = float(abs_weight) / denom if denom > 0 else 0.0
+            qf = quota_floor_from_share(share)
+            rel_w = normalize_rel_weight_from_share(share, denom)
+        elif share_in is not None:
+            share = float(share_in)
+            qf = quota_floor_from_share(share)
+            rel_w = normalize_rel_weight_from_share(share, wglobal4)
+            population = float(wglobal4)
         elif qf is not None:
+            # Cap already applied above.
             share = share_from_quota_floor(float(qf))
-            rel_w = normalize_rel_weight_from_share(share, wglobal4 if wglobal4 > 0 else float(population or 0.0))
+            rel_w = float(wglobal4) * float(qf)
+            population = float(wglobal4)
         else:
             rel_w = float(d.get("rel_weight", 0.0))
 
@@ -704,6 +793,7 @@ def parse_electorate_ballots(
     elect_defs: List[dict],
     wglobal2: float,
     wglobal4: float,
+    wglobal5: float,
     candidate_set: Set[str],
     profile: ElectionProfile,
     base_electorate_info: Optional[Dict[str, dict]] = None,
@@ -766,9 +856,11 @@ def parse_electorate_ballots(
         #   share_used = max(share1, share2)
         #   rel_weight = N_used * quota_floor(share_used)
         # Legacy support: if explicit population/quota_floor present, respect it.
-        population = d.get("population")
-        abs_weight = d.get("weight")
-        qf = d.get("quota_floor")
+        population = parse_numeric_optional(d.get("population"), field="electorate.population")
+        abs_weight = parse_numeric_optional(d.get("weight", d.get("abs_weight")), field="electorate.weight")
+        share_in = parse_numeric_optional(d.get("share"), field="electorate.share")
+        qf = parse_numeric_optional(d.get("quota_floor"), field="electorate.quota_floor")
+        qf = clamp_quota_floor(qf) if qf is not None else None
 
         share = None
         rel_w = 0.0
@@ -779,37 +871,43 @@ def parse_electorate_ballots(
 
         # Derive we2/we3 from turnout + parsed counts (even for legacy, for meta/audit).
         we1 = float(abs_weight) if abs_weight is not None else 0.0
-        we2 = float(turnout_alias) if turnout_alias is not None else 0.0
+        we2 = float(parse_numeric_optional(turnout_alias, field="electorate.turnout") or 0.0)
         we3 = max(
             we2,
-            float(be.get("counted_base_ballots", 0.0)),
-            float(pr.get("counted_partyrock_abs_weight", 0.0)),
+            float(parse_numeric_optional(be.get("counted_base_ballots", 0.0), field="electorate.counted_base_ballots") or 0.0),
+            float(parse_numeric_optional(pr.get("counted_partyrock_abs_weight", 0.0), field="electorate.counted_partyrock_abs_weight") or 0.0),
         )
         meta_extra.update({"we1": we1, "we2": we2, "we3": we3})
 
-        if (population is None and qf is None) and abs_weight is not None and (wglobal5 > 0 or wglobal4 > 0):
+        # Priority: weight -> share -> quota_floor
+        if abs_weight is not None and (wglobal5 > 0 or wglobal4 > 0):
             share1 = (we2 / wglobal5) if wglobal5 > 0 else 0.0
             share2 = (we3 / wglobal4) if wglobal4 > 0 else 0.0
             share_used = max(share1, share2)
             share = share_used
             qf = quota_floor_from_share(share_used)
-            # Global quota ballots use arena N = wglobal4 for rel_weight conversion.
             rel_w = normalize_rel_weight_from_share(share_used, wglobal4)
             meta_extra.update({
-                "share1": share1,
-                "share2": share2,
-                "share_used": share_used,
-                "N_arena": float(wglobal4),
+        "share1": share1,
+        "share2": share2,
+        "share_used": share_used,
+        "N_arena": float(wglobal4),
             })
             population = float(wglobal4)
-        elif population is not None and abs_weight is not None:
-            share = float(abs_weight) / float(population) if float(population) > 0 else 0.0
-            if qf is None:
-                qf = quota_floor_from_share(share)
-            rel_w = normalize_rel_weight_from_share(share, float(population))
+        elif abs_weight is not None and population is not None:
+            denom = float(population)
+            share = float(abs_weight) / denom if denom > 0 else 0.0
+            qf = quota_floor_from_share(share)
+            rel_w = normalize_rel_weight_from_share(share, denom)
+        elif share_in is not None:
+            share = float(share_in)
+            qf = quota_floor_from_share(share)
+            rel_w = normalize_rel_weight_from_share(share, wglobal4)
+            population = float(wglobal4)
         elif qf is not None:
             share = share_from_quota_floor(float(qf))
-            rel_w = normalize_rel_weight_from_share(share, wglobal4 if wglobal4 > 0 else float(population or 0.0))
+            rel_w = float(wglobal4) * float(qf)
+            population = float(wglobal4)
         else:
             rel_w = float(d.get("rel_weight", 0.0))
 
@@ -943,7 +1041,7 @@ def parse_partyrock_ballots(
             continue
 
         try:
-            abs_w = float(d.get("weight", 0.0))
+            abs_w = float(parse_numeric_optional(d.get("weight", 0.0), field="partyrock.weight") or 0.0)
         except Exception:
             abs_w = 0.0
         if abs_w <= 0:
@@ -1028,7 +1126,7 @@ def compute_partyrock_party_abs_sums(partyrock_defs: List[dict]) -> Dict[str, fl
         if not isinstance(d, dict):
             continue
         try:
-            w = float(d.get("weight", 0.0))
+            w = float(parse_numeric_optional(d.get("weight", 0.0), field="weight") or 0.0)
         except Exception:
             w = 0.0
         if w <= 0:
@@ -1050,7 +1148,7 @@ def compute_megarock_abs_sums(megarock_defs: List[dict]) -> Dict[str, float]:
         if not isinstance(d, dict):
             continue
         try:
-            w = float(d.get("weight", 0.0))
+            w = float(parse_numeric_optional(d.get("weight", 0.0), field="weight") or 0.0)
         except Exception:
             w = 0.0
         if w <= 0:
@@ -1115,7 +1213,7 @@ def parse_megarock_ballots(
             continue
 
         try:
-            wmr = float(d.get("weight", 0.0))
+            wmr = float(parse_numeric_optional(d.get("weight", 0.0), field="megarock.weight") or 0.0)
         except Exception:
             wmr = 0.0
         if wmr <= 0:
