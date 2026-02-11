@@ -166,7 +166,7 @@ Derived:
 
 ## Profiles
 
-### `general_alpha`
+### Prototype flagship: `general_alpha`
 
 Baseline FIFO sequential Phragmén with quota‑floor activation and the default spend tiers.
 
