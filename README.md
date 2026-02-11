@@ -164,7 +164,7 @@ Derived:
 
 ---
 
-## Profiles
+## Election Profiles
 
 ### Prototype flagship: `general_alpha`
 
