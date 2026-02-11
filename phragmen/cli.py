@@ -22,6 +22,23 @@ from .profiles import get_profile, list_profiles
 from .types import ElectionProfile, Group
 
 
+def _build_candidate_discrepancy_map(quota_groups: List[Group], quota_info: Dict[str, Tuple[bool, int, int]]) -> Dict[str, float]:
+    """Return mapping candidate -> max (required - in_set) across approving quota groups."""
+    out: Dict[str, float] = {}
+    for g in quota_groups:
+        if g.gid not in quota_info:
+            continue
+        _active, in_set, req = quota_info[g.gid]
+        disc = float(max(int(req) - int(in_set), 0))
+        if disc <= 0:
+            continue
+        for c in g.approvals:
+            prev = float(out.get(c, 0.0))
+            if disc > prev:
+                out[c] = disc
+    return out
+
+
 def open_csv(path: str, fieldnames: List[str]):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     f = open(path, "w", newline="", encoding="utf-8")
@@ -116,6 +133,7 @@ def run_sequential(
     party_groups: List[Group],
     electorate_groups: List[Group],
     party_lists: Dict[str, List[str]],
+    mega_lists: Optional[Dict[str, List[str]]],
     stop_when_proj_gt: Optional[float],
     prefix_allow_only_init: Optional[List[str]],
     ban_set: Optional[Set[str]],
@@ -184,6 +202,10 @@ def run_sequential(
             current_round = r
             quota_info = compute_quota_active_info(quota_groups, winners, current_round)
 
+            # Candidate-level quota dissatisfaction discrepancy maps used for tie-breaking.
+            party_discrepancy = _build_candidate_discrepancy_map(party_groups, quota_info)
+            mega_discrepancy = _build_candidate_discrepancy_map(mega_groups, quota_info)
+
             active_mask = [True] * len(groups)
             for g in quota_groups:
                 active_mask[gid_to_index[g.gid]] = bool(quota_info[g.gid][0])
@@ -222,6 +244,9 @@ def run_sequential(
                 supporters=supporters,
                 active_mask=active_mask,
                 party_lists=party_lists,
+                mega_lists=mega_lists or {},
+                party_discrepancy=party_discrepancy,
+                mega_discrepancy=mega_discrepancy,
                 allow_only_pool=pool_to_use,
                 dt0_tie_rule=dt0_tie_rule,
                 spend_mode=spend_mode,
@@ -365,6 +390,7 @@ def run_full_chamber_completion(
     party_groups: List[Group],
     electorate_groups: List[Group],
     party_lists: Dict[str, List[str]],
+    mega_lists: Dict[str, List[str]],
     prefix_allow: List[str],
     ban: Set[str],
     completion_target: float,
@@ -387,6 +413,7 @@ def run_full_chamber_completion(
         party_groups=party_groups,
         electorate_groups=electorate_groups,
         party_lists=party_lists,
+        mega_lists=mega_lists,
         stop_when_proj_gt=None,
         prefix_allow_only_init=prefix_allow,
         ban_set=ban,
@@ -713,7 +740,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 quota_groups=quota_groups,
                 party_lists={},
                 dt0_tie_rule="party_then_name",
-                spend_tiers_str="base>party",
+                spend_tiers_str="base>mega",
                 tier_within_mode="combined_fifo",
             )
 
@@ -748,6 +775,431 @@ def main(argv: Optional[List[str]] = None) -> None:
                         meta_update={"party_list_extended": True, "party_list_extension_size": len(ordered_extra)},
                     )
 
+    # -------------------------------------------------------------------------
+    # Candidate meta -> Mega/MegaRock binding + ordering (parsing-time only).
+    #
+    # Rules:
+    # 1) candidate_meta mega binding only EXTENDS approvals, and only for candidates already
+    #    in the candidate universe.
+    # 2) MegaRock binding: if a candidate has mega binding AND appears in an electorate's
+    #    candidate universe, it is auto-approved onto any MegaRock ballot (E, M) for that
+    #    electorate and mega.
+    # 3) MegaRock approvals EXTEND Mega approvals for the associated mega.
+    #
+    # Ordering:
+    # - MegaRock: run a mini general_alpha election per MegaRock ballot to produce an
+    #   ordered candidate list (stored in meta['ordered_candidates']).
+    # - Mega: run a mini general_alpha election per Mega to produce an ordered candidate
+    #   list (stored in mega_lists[mega_id] and in meta['ordered_candidates']).
+    #
+    # These ordered lists are used for tie-breaking later (but do not yet change allocation).
+    # -------------------------------------------------------------------------
+
+    # Initial mega_lists (from JSON input order), used as a starting point.
+    mega_lists: Dict[str, List[str]] = {}
+    for i, d in enumerate(data.get("mega_ballots", []) or []):
+        mid = str(d.get("id") or f"mega_{i}")
+        raw = [str(x) for x in (d.get("candidates") or []) if str(x).strip() != ""]
+        # Preserve order but filter to candidate universe
+        seen = set()
+        ordered = []
+        for c in raw:
+            if c in seen:
+                continue
+            seen.add(c)
+            if c in candidates:
+                ordered.append(c)
+        mega_lists[mid] = ordered
+
+    # candidate -> megas binding (ignore meta-only candidates)
+    cand_to_megas: Dict[str, Set[str]] = {}
+    for c, m in (candidate_meta or {}).items():
+        if c not in candidates:
+            continue
+        megas = m.get("megas")
+        if megas is None:
+            continue
+        if isinstance(megas, (str, int, float)):
+            megas = [str(megas)]
+        if not isinstance(megas, list):
+            continue
+        s = set(str(x) for x in megas if str(x).strip() != "")
+        if s:
+            cand_to_megas[c] = s
+
+    # Index electorates and megas
+    elect_by_gid: Dict[str, Group] = {g.gid: g for g in electorate_groups}
+    mega_by_gid: Dict[str, Group] = {g.gid: g for g in mega_groups}
+
+    # 2) MegaRock binding based on electorate candidate universe + candidate_meta.megas
+    new_megarock_groups: List[Group] = []
+    new_megarock_meta: List[Group] = []
+    for g in megarock_groups:
+        m = (g.meta or {})
+        eid = str(m.get("electorate") or "electorate_unknown")
+        mid = str(m.get("mega") or "mega_unknown")
+        e = elect_by_gid.get(eid)
+        e_cands = set(e.approvals) if e is not None else set()
+        add = sorted([c for c in e_cands if mid in cand_to_megas.get(c, set())])
+        cur_set = set(g.approvals)
+        added = [c for c in add if c not in cur_set]
+        new_apps = tuple(sorted(cur_set | set(added)))
+        ordered = list((m.get("ordered_candidates") or []))
+        for c in added:
+            if c not in ordered:
+                ordered.append(c)
+        meta2 = dict(m)
+        if added:
+            meta2["auto_approved_from_candidate_meta"] = {"mega": mid, "added": list(added)}
+        meta2["ordered_candidates"] = ordered
+        g2 = Group(
+            gid=g.gid,
+            kind=g.kind,
+            approvals=new_apps,
+            weight=g.weight,
+            quota_floor=g.quota_floor,
+            population=g.population,
+            abs_weight=g.abs_weight,
+            share=g.share,
+            meta=meta2,
+        )
+        new_megarock_groups.append(g2)
+        new_megarock_meta.append(g2)
+    megarock_groups = new_megarock_groups
+    megarock_meta = new_megarock_meta
+
+    # 3) MegaRock approvals extend Mega approvals (and will also include meta-bound candidates from above).
+    megarock_by_mega: Dict[str, Set[str]] = {}
+    for g in megarock_groups:
+        mid = str((g.meta or {}).get("mega") or "mega_unknown")
+        megarock_by_mega.setdefault(mid, set()).update(g.approvals)
+
+    # 1) candidate_meta mega binding extends Mega approvals (universe-only).
+    bound_by_mega: Dict[str, Set[str]] = {}
+    for c, mids in cand_to_megas.items():
+        for mid in mids:
+            bound_by_mega.setdefault(mid, set()).add(c)
+
+    new_mega_groups: List[Group] = []
+    new_mega_meta: List[Group] = []
+    for g in mega_groups:
+        mid = g.gid
+        cur = set(g.approvals)
+        add1 = set(bound_by_mega.get(mid, set()))
+        add2 = set(megarock_by_mega.get(mid, set()))
+        added = sorted([c for c in (add1 | add2) if c in candidates and c not in cur])
+        new_apps = tuple(sorted(cur | set(added)))
+
+        # Extend mega_lists (preserve existing order; append missing deterministically for now)
+        lst = list(mega_lists.get(mid, []))
+        for c in added:
+            if c not in lst:
+                lst.append(c)
+        # Ensure list covers approvals (append any remaining missing)
+        for c in sorted(new_apps):
+            if c not in lst:
+                lst.append(c)
+        mega_lists[mid] = lst
+
+        meta2 = dict(g.meta or {})
+        if added:
+            meta2["approvals_extended"] = {
+                "from_candidate_meta": sorted(set(bound_by_mega.get(mid, set())) & set(added)),
+                "from_megarock": sorted(set(megarock_by_mega.get(mid, set())) & set(added)),
+            }
+        g2 = Group(
+            gid=g.gid,
+            kind=g.kind,
+            approvals=new_apps,
+            weight=g.weight,
+            quota_floor=g.quota_floor,
+            population=g.population,
+            abs_weight=g.abs_weight,
+            share=g.share,
+            meta=meta2,
+        )
+        new_mega_groups.append(g2)
+        new_mega_meta.append(g2)
+    mega_groups = new_mega_groups
+    mega_meta = new_mega_meta
+
+    # --- MegaRock mini ordering ---
+    partyrock_by_eid: Dict[str, List[Group]] = {}
+    for g in partyrock_groups:
+        eid = str((g.meta or {}).get("electorate") or "electorate_unknown")
+        partyrock_by_eid.setdefault(eid, []).append(g)
+
+    updated_megarock_groups: List[Group] = []
+    updated_megarock_meta: List[Group] = []
+    for g in megarock_groups:
+        m = g.meta or {}
+        eid = str(m.get("electorate") or "electorate_unknown")
+        candset = set(g.approvals)
+        if not candset:
+            updated_megarock_groups.append(g)
+            updated_megarock_meta.append(g)
+            continue
+
+        # Base ballots: only those registered to this electorate, restricted to candset.
+        base_agg: Dict[Tuple[str, ...], float] = {}
+        base_sum = 0.0
+        for b in raw_base_ballots:
+            if not isinstance(b, dict):
+                continue
+            beid = b.get("electorate")
+            if beid is None:
+                beid = b.get("electorate_id")
+            if beid is None:
+                beid = b.get("electorate_gid")
+            beid = str(beid) if beid is not None and str(beid).strip() != "" else "electorate_unknown"
+            if beid != eid:
+                continue
+            apps = [str(x) for x in (b.get("approvals") or [])]
+            apps = [a for a in apps if a in candset]
+            if not apps:
+                continue
+            try:
+                w = float(b.get("weight", 1.0))
+            except Exception:
+                w = 0.0
+            if w <= 0:
+                continue
+            key = tuple(sorted(set(apps)))
+            base_agg[key] = base_agg.get(key, 0.0) + w
+            base_sum += w
+
+        mini_base_groups = [
+            Group(
+                gid=f"mini_mr_base_{g.gid}_{i}",
+                kind="base",
+                approvals=apps,
+                weight=float(w),
+                abs_weight=float(w),
+                meta={"source": "mini_megarock_order", "megarock": g.gid, "electorate": eid},
+            )
+            for i, (apps, w) in enumerate(base_agg.items())
+        ]
+
+        # Quota ballots: PartyRock in the same electorate, restricted to candset.
+        pr_sum_abs = 0.0
+        pr_items = []
+        for i, pr in enumerate(partyrock_by_eid.get(eid, [])):
+            apps = tuple(sorted(set([c for c in pr.approvals if c in candset])))
+            if not apps:
+                continue
+            abs_w = float(pr.abs_weight or 0.0)
+            if abs_w <= 0:
+                continue
+            pr_sum_abs += abs_w
+            pr_items.append((i, apps, abs_w))
+
+        mini_pop = float(max(base_sum, pr_sum_abs, 0.0))
+        if mini_pop <= 0:
+            ordered = list(sorted(candset))
+        else:
+            quota_groups = []
+            for i, apps, abs_w in pr_items:
+                share = (abs_w / mini_pop) if mini_pop > 0 else 0.0
+                qf = io_mod.quota_floor_from_share(share)
+                rel_w = io_mod.normalize_rel_weight_from_share(share, mini_pop)
+                quota_groups.append(
+                    Group(
+                        gid=f"mini_mr_pr_{g.gid}_{i}",
+                        kind="party",
+                        approvals=apps,
+                        weight=float(rel_w),
+                        quota_floor=float(qf),
+                        population=float(mini_pop),
+                        abs_weight=float(abs_w),
+                        share=float(share),
+                        meta={"source": "mini_megarock_order", "megarock": g.gid, "electorate": eid, "mini_pop": mini_pop},
+                    )
+                )
+            ordered = run_fifo_ordering_general_alpha(
+                candidates=sorted(candset),
+                base_groups=mini_base_groups,
+                quota_groups=quota_groups,
+                party_lists={},
+                dt0_tie_rule="party_then_name",
+                spend_tiers_str="base>party",
+                tier_within_mode="combined_fifo",
+            )
+            missing = [c for c in sorted(candset) if c not in set(ordered)]
+            if missing:
+                ordered.extend(sorted(missing))
+
+        meta2 = dict(m)
+        meta2["ordered_candidates"] = list(ordered)
+        meta2["mini_pop"] = float(mini_pop)
+        g2 = Group(
+            gid=g.gid,
+            kind=g.kind,
+            approvals=g.approvals,
+            weight=g.weight,
+            quota_floor=g.quota_floor,
+            population=g.population,
+            abs_weight=g.abs_weight,
+            share=g.share,
+            meta=meta2,
+        )
+        updated_megarock_groups.append(g2)
+        updated_megarock_meta.append(g2)
+
+    megarock_groups = updated_megarock_groups
+    megarock_meta = updated_megarock_meta
+
+    # --- Mega mini ordering ---
+    updated_mega_groups: List[Group] = []
+    updated_mega_meta: List[Group] = []
+    for g in mega_groups:
+        mid = g.gid
+        candset = set(g.approvals)
+        if not candset:
+            updated_mega_groups.append(g)
+            updated_mega_meta.append(g)
+            continue
+
+        # Base ballots: any base ballot that approves any mega candidate (restricted to candset).
+        base_agg: Dict[Tuple[str, ...], float] = {}
+        base_sum = 0.0
+        for b in raw_base_ballots:
+            if not isinstance(b, dict):
+                continue
+            apps = [str(x) for x in (b.get("approvals") or [])]
+            apps = [a for a in apps if a in candset]
+            if not apps:
+                continue
+            try:
+                w = float(b.get("weight", 1.0))
+            except Exception:
+                w = 0.0
+            if w <= 0:
+                continue
+            key = tuple(sorted(set(apps)))
+            base_agg[key] = base_agg.get(key, 0.0) + w
+            base_sum += w
+
+        mini_base_groups = [
+            Group(
+                gid=f"mini_m_base_{mid}_{i}",
+                kind="base",
+                approvals=apps,
+                weight=float(w),
+                abs_weight=float(w),
+                meta={"source": "mini_mega_order", "mega": mid},
+            )
+            for i, (apps, w) in enumerate(base_agg.items())
+        ]
+
+        # Quota ballots: MegaRock ballots linked to this mega that approve any mega candidate (restricted to candset).
+        mr_sum_abs = 0.0
+        mr_items = []
+        for i, mr in enumerate(megarock_groups):
+            if not isinstance(mr.meta, dict):
+                continue
+            if str(mr.meta.get("mega")) != str(mid):
+                continue
+            apps = tuple(sorted(set([c for c in mr.approvals if c in candset])))
+            if not apps:
+                continue
+            abs_w = float(mr.abs_weight or 0.0)
+            if abs_w <= 0:
+                continue
+            mr_sum_abs += abs_w
+            mr_items.append((i, apps, abs_w, mr.gid))
+
+        mini_pop = float(max(base_sum, mr_sum_abs, 0.0))
+        if mini_pop <= 0:
+            ordered = list(sorted(candset))
+        else:
+            quota_groups = []
+            for i, apps, abs_w, gid in mr_items:
+                share = (abs_w / mini_pop)
+                qf = min((2.0 / 3.0) * share, 1.0 / 3.0)
+                rel_w = mini_pop * qf
+                quota_groups.append(
+                    Group(
+                        gid=f"mini_m_mrquota_{mid}_{i}",
+                        kind="mega",
+                        approvals=apps,
+                        weight=float(rel_w),
+                        abs_weight=float(abs_w),
+                        quota_floor=float(qf),
+                        meta={
+                            "source": "mini_mega_order_quota_megarock",
+                            "mega": mid,
+                            "megarock_gid": gid,
+                            "share": float(share),
+                            "quota_floor": float(qf),
+                            "N_arena": float(mini_pop),
+                        },
+                    )
+                )
+
+            ordered = run_fifo_ordering_general_alpha(
+                candidates=list(sorted(candset)),
+                base_groups=mini_base_groups,
+                quota_groups=quota_groups,
+                party_lists=None,
+                dt0_tie_rule="party_then_name",
+                spend_tiers_str="base>party",
+                tier_within_mode="combined_fifo",
+            )
+        if mini_pop <= 0:
+            ordered = list(sorted(candset))
+        else:
+            quota_groups = []
+            for i, apps, abs_w, pid in party_items:
+                share = (abs_w / mini_pop) if mini_pop > 0 else 0.0
+                qf = io_mod.quota_floor_from_share(share)
+                rel_w = io_mod.normalize_rel_weight_from_share(share, mini_pop)
+                quota_groups.append(
+                    Group(
+                        gid=f"mini_m_party_{mid}_{i}",
+                        kind="party",
+                        approvals=apps,
+                        weight=float(rel_w),
+                        quota_floor=float(qf),
+                        population=float(mini_pop),
+                        abs_weight=float(abs_w),
+                        share=float(share),
+                        meta={"source": "mini_mega_order", "mega": mid, "party": pid, "mini_pop": mini_pop},
+                    )
+                )
+            ordered = run_fifo_ordering_general_alpha(
+                candidates=sorted(candset),
+                base_groups=mini_base_groups,
+                quota_groups=quota_groups,
+                party_lists={},
+                dt0_tie_rule="party_then_name",
+                spend_tiers_str="base>party",
+                tier_within_mode="combined_fifo",
+            )
+            missing = [c for c in sorted(candset) if c not in set(ordered)]
+            if missing:
+                ordered.extend(sorted(missing))
+
+        mega_lists[mid] = list(ordered)
+        meta2 = dict(g.meta or {})
+        meta2["ordered_candidates"] = list(ordered)
+        meta2["mini_pop"] = float(mini_pop)
+        g2 = Group(
+            gid=g.gid,
+            kind=g.kind,
+            approvals=g.approvals,
+            weight=g.weight,
+            quota_floor=g.quota_floor,
+            population=g.population,
+            abs_weight=g.abs_weight,
+            share=g.share,
+            meta=meta2,
+        )
+        updated_mega_groups.append(g2)
+        updated_mega_meta.append(g2)
+
+    mega_groups = updated_mega_groups
+    mega_meta = updated_mega_meta
+
     candidates_list = sorted(candidates)
     os.makedirs(args.outdir, exist_ok=True)
 
@@ -755,6 +1207,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     io_mod.write_globals_kv_csv(os.path.join(args.outdir, 'audit_globals.csv'), globals_ctx, norm_ctx=norm_ctx)
     io_mod.write_groups_audit_csv(os.path.join(args.outdir, 'audit_groups.csv'), base_groups + mega_meta + party_meta + electorate_meta + partyrock_meta + megarock_meta)
     io_mod.write_party_lists_csv(os.path.join(args.outdir, 'audit_party_lists.csv'), party_lists)
+    io_mod.write_party_lists_csv(os.path.join(args.outdir, 'audit_mega_lists.csv'), mega_lists)
 
 
     if args.quota_meta_csv:
@@ -775,6 +1228,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         party_groups=party_groups,
         electorate_groups=electorate_groups,
         party_lists=party_lists,
+        mega_lists=mega_lists,
         stop_when_proj_gt=None,
         prefix_allow_only_init=prefix_allow,
         ban_set=ban,
@@ -823,6 +1277,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 party_groups=party_groups,
                 electorate_groups=electorate_groups,
                 party_lists=party_lists,
+                mega_lists=mega_lists,
                 stop_when_proj_gt=profile.sig_target,
                 prefix_allow_only_init=prefix_allow,
                 ban_set=ban,
@@ -853,6 +1308,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 party_groups=party_groups,
                 electorate_groups=electorate_groups,
                 party_lists=party_lists,
+                mega_lists=mega_lists,
                 stop_when_proj_gt=profile.sig_target,
                 prefix_allow_only_init=prefix_allow,
                 ban_set=ban,
@@ -905,6 +1361,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             party_groups=party_groups,
             electorate_groups=electorate_groups,
             party_lists=party_lists,
+            mega_lists=mega_lists,
             prefix_allow=prefix_allow,
             ban=ban,
             completion_target=profile.completion_target,

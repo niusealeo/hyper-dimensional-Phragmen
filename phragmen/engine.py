@@ -96,6 +96,29 @@ def tie_break_by_party_order(tied_candidates: List[str], party_lists: Dict[str, 
     return best[1] if best is not None else min(tied_candidates)
 
 
+def tie_break_by_list_order(tied_candidates: List[str], lists: Dict[str, List[str]]) -> str:
+    """Tie-break using the best (lowest) rank index across any provided ordered lists.
+
+    The lists map key -> ordered list of candidates. A candidate may appear in 0+ lists.
+    We select the candidate with the minimum rank across all lists; ties fall back to name.
+    If no candidates appear in any list, fall back to lexical.
+    """
+    rank_maps = party_rank_maps(lists)
+    best = None  # (rank_index, candidate)
+    for c in tied_candidates:
+        best_rank = None
+        for rm in rank_maps.values():
+            if c in rm:
+                r = rm[c]
+                if best_rank is None or r < best_rank:
+                    best_rank = r
+        if best_rank is not None:
+            key = (best_rank, c)
+            if best is None or key < best:
+                best = key
+    return best[1] if best is not None else min(tied_candidates)
+
+
 def quota_required(quota_floor: float, current_round: int) -> int:
     return int(math.ceil(quota_floor * current_round - 1e-15))
 
@@ -273,6 +296,9 @@ def choose_candidate_for_round(
     supporters: Dict[str, List[int]],
     active_mask: List[bool],
     party_lists: Dict[str, List[str]],
+    mega_lists: Optional[Dict[str, List[str]]] = None,
+    party_discrepancy: Optional[Dict[str, float]] = None,
+    mega_discrepancy: Optional[Dict[str, float]] = None,
     allow_only_pool: Optional[Set[str]] = None,
     dt0_tie_rule: str = "party_then_name",
     spend_mode: str = "fifo_time_priority",
@@ -311,21 +337,60 @@ def choose_candidate_for_round(
         dt, c, have, rate = tied[0]
         return c, dt, have, rate, allow_used
 
-    if abs(best_dt) <= 1e-12 and dt0_tie_rule == "max_have_then_party_then_name":
-        max_have = max(h for (_dt, _c, h, _r) in tied)
-        tied2 = [t for t in tied if abs(t[2] - max_have) <= 1e-12]
-        if len(tied2) == 1:
-            dt, c, have, rate = tied2[0]
-            return c, dt, have, rate, allow_used
-        tied_candidates2 = [c for (_dt, c, _have, _rate) in tied2]
-        chosen = tie_break_by_party_order(tied_candidates2, party_lists)
-        for dt, c, have, rate in tied2:
-            if c == chosen:
-                return c, dt, have, rate, allow_used
+    # Updated tie-break order:
+    #   1) max have (for dt == 0 ties)
+    #   2) party with largest quota dissatisfaction discrepancy
+    #   3) party list order
+    #   4) mega with largest quota dissatisfaction discrepancy
+    #   5) mega list order
+    #   6) lexical candidate id
+    mega_lists = mega_lists or {}
+    party_discrepancy = party_discrepancy or {}
+    mega_discrepancy = mega_discrepancy or {}
 
-    tied_candidates = [c for (_dt, c, _have, _rate) in tied]
-    chosen = tie_break_by_party_order(tied_candidates, party_lists)
-    for dt, c, have, rate in tied:
+    tied_work = list(tied)
+
+    if abs(best_dt) <= 1e-12:
+        max_have = max(h for (_dt, _c, h, _r) in tied_work)
+        tied_work = [t for t in tied_work if abs(t[2] - max_have) <= 1e-12]
+        if len(tied_work) == 1:
+            dt, c, have, rate = tied_work[0]
+            return c, dt, have, rate, allow_used
+
+    # 2) party dissatisfaction discrepancy
+    max_pd = max(float(party_discrepancy.get(c, 0.0)) for (_dt, c, _h, _r) in tied_work)
+    if max_pd > 0:
+        tied_work = [t for t in tied_work if abs(float(party_discrepancy.get(t[1], 0.0)) - max_pd) <= 1e-12]
+        if len(tied_work) == 1:
+            dt, c, have, rate = tied_work[0]
+            return c, dt, have, rate, allow_used
+
+    # 3) party list order (only if at least one tied candidate appears in any party list)
+    tied_candidates = [c for (_dt, c, _have, _rate) in tied_work]
+    if party_lists:
+        rm = party_rank_maps(party_lists)
+        any_ranked = any(any(c in m for m in rm.values()) for c in tied_candidates)
+    else:
+        any_ranked = False
+    if any_ranked:
+        chosen = tie_break_by_party_order(tied_candidates, party_lists)
+        if chosen in tied_candidates:
+            for dt, c, have, rate in tied_work:
+                if c == chosen:
+                    return c, dt, have, rate, allow_used
+
+    # 4) mega dissatisfaction discrepancy
+    max_md = max(float(mega_discrepancy.get(c, 0.0)) for (_dt, c, _h, _r) in tied_work)
+    if max_md > 0:
+        tied_work = [t for t in tied_work if abs(float(mega_discrepancy.get(t[1], 0.0)) - max_md) <= 1e-12]
+        if len(tied_work) == 1:
+            dt, c, have, rate = tied_work[0]
+            return c, dt, have, rate, allow_used
+
+    # 5) mega list order
+    tied_candidates = [c for (_dt, c, _have, _rate) in tied_work]
+    chosen = tie_break_by_list_order(tied_candidates, mega_lists)
+    for dt, c, have, rate in tied_work:
         if c == chosen:
             return c, dt, have, rate, allow_used
 
