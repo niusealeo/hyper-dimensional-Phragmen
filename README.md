@@ -166,11 +166,11 @@ Derived:
 
 ## Profiles
 
-### `general_alpha`
+### `general_alpha` (should work ok)
 
 Baseline FIFO sequential Phragmén with quota‑floor activation and the default spend tiers.
 
-### `12`
+### `12` (currently under construction, yet to finish)
 
 Adds constant (election‑wide) normalisation multipliers computed from absolute totals:
 
@@ -183,7 +183,7 @@ Multipliers:
 - Base voter multiplier: `(n + (2x - y)) / (3n)`
 - Party multiplier: `(2n - (2x - y)) / (3n)`
 
-### `324`
+### `324` (currently under construction, yet to finish)
 
 Same as `12`, with different constants:
 
