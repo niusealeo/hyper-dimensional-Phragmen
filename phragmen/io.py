@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional, Set, Tuple, Any
 from collections import defaultdict
 import csv
+import json
 import math
 
 from .types import Group, ElectionProfile
@@ -349,11 +350,12 @@ def compute_global_totals(data: dict) -> dict:
       - total_turnout (wglobal3)
 
     Derived:
-      - wglobal4 = max(wglobal3, sum(party abs), sum(partyrock abs), sum(base abs))
+      - wglobal4 = max(wglobal3, sum(party wp1), sum(PartyRock wpr1), sum(base wr))
+      - wglobal5 = max(wglobal2, sum(electorate we1))
 
     If any of wglobal1-3 are missing/invalid, defaults are computed where possible:
-      - total_turnout defaults to sum(base abs)
-      - total_enrollment defaults to sum(electorate enrollment abs)
+      - total_turnout defaults to sum(base wr)
+      - total_enrollment defaults to sum(electorate we1)
       - total_population defaults to total_enrollment
     """
     d = data or {}
@@ -391,6 +393,14 @@ def compute_global_totals(data: dict) -> dict:
         if w > 0:
             partyrock_abs += w
 
+    electorate_enroll_abs = 0.0
+    for e in d.get("electorate_ballots", []) or []:
+        if not isinstance(e, dict):
+            continue
+        w = _f(e.get("weight", e.get("abs_weight", 0.0)))
+        if w > 0:
+            electorate_enroll_abs += w
+
     # Globals.
     wglobal1 = _f(d.get("total_population", d.get("wglobal1")))
     wglobal2 = _f(d.get("total_enrollment", d.get("wglobal2")))
@@ -399,23 +409,23 @@ def compute_global_totals(data: dict) -> dict:
     if wglobal3 <= 0:
         wglobal3 = base_abs
     if wglobal2 <= 0:
-        # fallback: sum electorate enrollments if available
-        for e in d.get("electorate_ballots", []) or []:
-            if not isinstance(e, dict):
-                continue
-            wglobal2 += _f(e.get("weight", e.get("abs_weight", 0.0)))
+        wglobal2 = electorate_enroll_abs
     if wglobal1 <= 0:
-        wglobal1 = wglobal2 if wglobal2 > 0 else max(wglobal3, 0.0)
+        wglobal1 = wglobal2 if wglobal5 > 0 else max(wglobal3, 0.0)
 
     wglobal4 = max(wglobal3, party_abs, partyrock_abs, base_abs)
+    wglobal5 = max(wglobal2, electorate_enroll_abs)
+
     return {
         "wglobal1": float(wglobal1),
         "wglobal2": float(wglobal2),
         "wglobal3": float(wglobal3),
         "wglobal4": float(wglobal4),
+        "wglobal5": float(wglobal5),
         "sum_base_abs": float(base_abs),
         "sum_party_abs": float(party_abs),
         "sum_partyrock_abs": float(partyrock_abs),
+        "sum_electorate_enroll_abs": float(electorate_enroll_abs),
     }
 
 
@@ -448,10 +458,70 @@ def write_meta_csv(path: str, groups: List[Group]) -> None:
             })
 
 
+
+
+def write_globals_csv(path: str, globals_ctx: dict, norm_ctx: dict | None = None) -> None:
+    """Write computed global totals (and optional profile normalisation context) to a key/value CSV."""
+    rows = []
+    for k in sorted((globals_ctx or {}).keys()):
+        rows.append({"key": k, "value": (globals_ctx or {}).get(k)})
+    if norm_ctx:
+        for k in sorted(norm_ctx.keys()):
+            rows.append({"key": f"norm_{k}", "value": norm_ctx.get(k)})
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["key", "value"])
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+GROUP_AUDIT_FIELDS = [
+    "gid",
+    "kind",
+    "population",
+    "abs_weight",
+    "share",
+    "quota_floor",
+    "rel_weight",
+    "approvals_size",
+    "meta_json",
+]
+
+
+def write_groups_audit_csv(path: str, groups: List[Group]) -> None:
+    """Write per-group computed fields, plus the full meta dict as JSON."""
+    import json as _json
+
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=GROUP_AUDIT_FIELDS)
+        w.writeheader()
+        for g in groups:
+            w.writerow({
+                "gid": g.gid,
+                "kind": g.kind,
+                "population": g.population if g.population is not None else "",
+                "abs_weight": g.abs_weight if g.abs_weight is not None else "",
+                "share": g.share if g.share is not None else "",
+                "quota_floor": g.quota_floor if g.quota_floor is not None else "",
+                "rel_weight": g.weight,
+                "approvals_size": len(g.approvals),
+                "meta_json": _json.dumps(g.meta or {}, ensure_ascii=False, sort_keys=True),
+            })
+
+
+def write_party_lists_csv(path: str, party_lists: Dict[str, List[str]]) -> None:
+    """Write party lists (including PartyRock extensions) in an explicit stable order."""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["party_id", "pos", "candidate"])
+        w.writeheader()
+        for pid in sorted((party_lists or {}).keys()):
+            lst = party_lists.get(pid) or []
+            for i, c in enumerate(lst, start=1):
+                w.writerow({"party_id": pid, "pos": i, "candidate": c})
 def parse_party_ballots(
     party_defs: List[dict],
-    wglobal5: float,
     wglobal4: float,
+    wglobal5: float,
     partyrock_abs_by_party: Optional[Dict[str, float]],
     partyrock_norm_sum_by_party: Optional[Dict[str, float]],
     profile: ElectionProfile,
@@ -484,14 +554,12 @@ def parse_party_ballots(
         rel_w = 0.0
         meta_extra: Dict[str, Any] = {}
 
-        if (population is None and qf is None) and abs_weight is not None and (wglobal2 > 0 or wglobal4 > 0):
+        if (population is None and qf is None) and abs_weight is not None and (wglobal5 > 0 or wglobal4 > 0):
             wp1 = float(abs_weight)
             pr_abs = float((partyrock_abs_by_party or {}).get(gid, 0.0))
             wp2 = max(wp1, pr_abs)
-
-            wp3 = float((partyrock_norm_sum_by_party or {}).get(gid, 0.0))
-
             share1 = (wp2 / wglobal4) if wglobal4 > 0 else 0.0
+            wp3 = float((partyrock_norm_sum_by_party or {}).get(gid, 0.0))
             share2 = (wp3 / wglobal5) if wglobal5 > 0 else 0.0
             share_used = max(share1, share2)
             share = share_used
@@ -693,7 +761,7 @@ def parse_electorate_ballots(
         #   we1 = abs enrollment weight (json)
         #   we2 = abs electorate turnout (json)
         #   we3 = max(we1, sum(partyrock abs for electorate), sum(base abs for electorate))
-        #   share1 = we2 / wglobal2
+        #   share1 = we2 / wglobal5
         #   share2 = we3 / wglobal4
         #   share_used = max(share1, share2)
         #   rel_weight = N_used * quota_floor(share_used)
@@ -719,8 +787,8 @@ def parse_electorate_ballots(
         )
         meta_extra.update({"we1": we1, "we2": we2, "we3": we3})
 
-        if (population is None and qf is None) and abs_weight is not None and (wglobal2 > 0 or wglobal4 > 0):
-            share1 = (we1 / wglobal2) if wglobal2 > 0 else 0.0
+        if (population is None and qf is None) and abs_weight is not None and (wglobal5 > 0 or wglobal4 > 0):
+            share1 = (we2 / wglobal5) if wglobal5 > 0 else 0.0
             share2 = (we3 / wglobal4) if wglobal4 > 0 else 0.0
             share_used = max(share1, share2)
             share = share_used
@@ -1001,7 +1069,7 @@ def parse_megarock_ballots(
     megarock_defs: List[dict],
     electorate_groups: List[Group],
     wglobal1: float,
-    wglobal2: float,
+    wglobal5: float,
     candidate_set: Set[str],
 ) -> Tuple[List[Group], List[Group]]:
     """Parse MegaRock ballots (parsing-only; not used by any profile algorithm yet).
@@ -1014,7 +1082,7 @@ def parse_megarock_ballots(
 
     Local share definition:
       - we1 = electorate abs enrollment
-      - share1 = wmr / (we1 * wglobal1 / wglobal2)
+      - share1 = wmr / (we1 * wglobal1 / wglobal5)
 
     Canonical quota mapping (for future use):
       quota_floor = min((2/3)*share1, 1/3)
@@ -1092,7 +1160,7 @@ def parse_megarock_ballots(
                 float(m.get("counted_base_ballots", 0.0) or 0.0),
                 float(m.get("counted_partyrock_abs_weight", 0.0) or 0.0),
             )
-        denom = (we1 * float(wglobal1) / float(wglobal2)) if (we1 > 0 and wglobal1 > 0 and wglobal2 > 0) else 0.0
+        denom = (we1 * float(wglobal1) / float(wglobal5)) if (we1 > 0 and wglobal1 > 0 and wglobal5 > 0) else 0.0
         share1 = (wmr / denom) if denom > 0 else 0.0
         qf = quota_floor_from_share(share1) if denom > 0 else 0.0
         rel_w = normalize_rel_weight_from_share(share1, we3) if denom > 0 else 0.0
