@@ -1,4 +1,5 @@
-A few bugs here and there, see repository's `flagship_prototype_general_alpha` branch for previous version before recent algorithm changing updates.
+A few bugs here and there, see repository's `flagship_prototype_general_alpha` branch for previous (buggy) version before recent algorithm changing updates.
+Upcoming changes: Will separate voter candidate ballots and proportionate quota floor ballots into separate non-intermingled but mutually interdependent lanes.
 
 # Phragmén FIFO (Sequential) — quota floors, FIFO spend, audit
 
